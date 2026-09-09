@@ -1,0 +1,49 @@
+[Unit]
+Description=Stage Audio Works Video Player
+# network-online.target only — do NOT add NetworkManager-wait-online.service here.
+# A Wants= pulls that unit in even when it has been disabled, and it can add
+# minutes to boot. Nothing here needs the network to be up: video playback is
+# entirely local, and Flask binds 0.0.0.0 fine before an address is assigned.
+After=network-online.target
+Wants=network-online.target
+# DRM display device must exist before mpv tries to open it.
+After=dev-dri-card1.device
+Wants=dev-dri-card1.device
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+
+# 5 s covers DRM/ALSA device settle time and WiFi DHCP completion.
+# Reduce to 3 if using wired Ethernet only.
+WorkingDirectory=/home/pi
+ExecStartPre=/bin/sleep 5
+
+ExecStart=/usr/bin/python3 /home/pi/saw_player.py
+
+# ── Restart behaviour ──────────────────────────────────────────────────────
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=5
+
+# ── Environment ───────────────────────────────────────────────────────────
+# Required for DRM device access
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+# NOTE: no GPIOZERO_PIN_FACTORY here — gpiozero is not used. The player calls
+# lgpio directly (gpiozero throws BadPinFactory under systemd on the Pi 5).
+
+# ── Resource limits ───────────────────────────────────────────────────────
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=10
+
+# ── Logging ───────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=saw-player
+
+[Install]
+WantedBy=multi-user.target
