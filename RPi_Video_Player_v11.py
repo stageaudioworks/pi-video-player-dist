@@ -32,6 +32,11 @@ Features:
     PCMs via 'aplay -L'; changing the device hot-restarts mpv so audio
     switches without a page reload. Built for USB headphone adapters:
     plug in, refresh the page, pick the device, done.
+  • Forced output resolution and refresh rate, persisted across reboots.
+    Resolutions come from what the attached display reports; refresh rate is a
+    fixed list of candidates, since the display reports rates for no mode.
+    Falls back to the display's preferred mode automatically if mpv cannot
+    start on the chosen combination, so a wrong pick cannot cost the picture.
   • Web UI — video upload/download, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -66,10 +71,17 @@ Audio device endpoints:
   /audio_devices GET  — list available ALSA devices
   /audio_device  GET  — currently active device
   /audio_device  POST — set new device, persist, hot-restart mpv
+
+Display endpoints:
+  /display_modes GET  — modes the attached display advertises
+  /resolution    GET  — current output mode + refresh rate mpv reports
+  /resolution    POST — force a mode, persist, hot-restart mpv; reverts to
+                        "preferred" automatically if mpv will not start on it
 """
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import json
@@ -146,6 +158,31 @@ DRM_CONNECTOR = "HDMI-A-1"
 ALSA_DEVICE_DEFAULT = "alsa/plughw:CARD=vc4hdmi0,DEV=0"
 AUDIO_DEVICE_FILE   = "/home/pi/.mpv_audio_device"   # persists selected device
 
+# -- Output resolution / display mode ----------------------------------------
+# mpv performs the KMS modeset when it takes over the display, so --drm-mode is
+# what actually forces the Pi's HDMI output resolution while the player runs.
+# "preferred" means "whatever the display advertises as its preferred mode",
+# which is the safe default and the behaviour every version before this one had.
+#
+# Accepted values: "preferred", "highest", a mode index, or WxH[@R]
+# e.g. 1920x1080 or 1920x1080@50.  Content here is PAL 25 fps, so a 50 Hz mode
+# divides evenly into the frame rate and a 60 Hz one does not - if you see
+# judder on an otherwise fine file, try forcing @50.
+RESOLUTION_FILE    = "/home/pi/.mpv_resolution"   # persists selected output mode
+RESOLUTION_DEFAULT = "preferred"
+
+# Modes the attached display advertises, straight from the kernel.
+# NOTE: sysfs uses the LONG connector name (card1-HDMI-A-1) while mpv wants the
+# SHORT one (HDMI-A-1).  Mixing these up is a documented trap on this project.
+DRM_MODES_SYSFS = f"/sys/class/drm/{DRM_DEVICE}-{DRM_CONNECTOR}/modes"
+
+# Validates anything we are about to hand to --drm-mode.  Also rejects
+# interlaced entries such as "1920x1080i" that appear in sysfs but are not a
+# valid --drm-mode value.
+RESOLUTION_RE = re.compile(
+    r"^(?:preferred|highest|[0-9]{1,2}|[0-9]{3,5}x[0-9]{3,5}(?:@[0-9]{1,3}(?:\.[0-9]{1,3})?)?)$"
+)
+
 # ── mpv IPC socket ────────────────────────────────────────────────────────────
 MPV_SOCKET = "/tmp/saw_mpv.sock"
 
@@ -221,6 +258,7 @@ class PlayerState:
     paused:                bool          = False
     volume:                int           = DEFAULT_VOLUME
     audio_device:          str           = ALSA_DEVICE_DEFAULT
+    resolution:            str           = RESOLUTION_DEFAULT
 
 state      = PlayerState()
 state_lock = threading.Lock()
@@ -434,6 +472,85 @@ def list_audio_devices() -> list:
     return devices
 
 # ══════════════════════════════════════════════════════════════════════════════
+# OUTPUT RESOLUTION PERSISTENCE + ENUMERATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_resolution(mode: str):
+    """
+    Persist the selected output mode.
+
+    Written via a temp file + os.replace rather than open(path, "w"): opening
+    the real file truncates it immediately, so a failure mid-write would leave
+    an empty file behind.  An empty or garbled mode is the one setting here
+    that can cost a headless unit its picture on the next boot, so it is worth
+    the few extra lines to make the write atomic.
+    """
+    try:
+        directory = os.path.dirname(RESOLUTION_FILE) or "."
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".mpv_resolution.")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(mode.strip())
+            os.replace(tmp, RESOLUTION_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            raise
+    except Exception:
+        logger.exception("Error saving resolution")
+
+def load_saved_resolution() -> str:
+    """
+    Load the persisted output mode, falling back to the safe default.
+
+    A saved value that no longer passes validation is ignored rather than
+    handed to mpv - better to come up at the display's preferred mode than not
+    to come up at all.
+    """
+    try:
+        if os.path.exists(RESOLUTION_FILE):
+            raw = open(RESOLUTION_FILE).read().strip()
+            if raw and RESOLUTION_RE.match(raw):
+                return raw
+            if raw:
+                logger.warning("Ignoring invalid saved resolution %r - using %s",
+                               raw, RESOLUTION_DEFAULT)
+    except Exception:
+        logger.exception("Error loading saved resolution")
+    return RESOLUTION_DEFAULT
+
+def list_drm_modes() -> list:
+    """
+    Return the modes the attached display advertises, in the kernel's order.
+
+    Read from sysfs, so there is no extra package to install and no parsing of
+    modetest output.  The list is exactly what the screen reported over EDID,
+    which is why the UI only ever offers modes that stand a chance of working.
+
+    An empty list means the file could not be read - usually nothing plugged
+    into the HDMI port.  Treat that as "unknown", not "no modes available".
+    """
+    modes = []
+    try:
+        with open(DRM_MODES_SYSFS) as f:
+            for line in f:
+                mode = line.strip()
+                if not mode or mode in modes:
+                    continue
+                if RESOLUTION_RE.match(mode):
+                    modes.append(mode)
+                else:
+                    logger.debug("Skipping unusable display mode: %s", mode)
+    except FileNotFoundError:
+        logger.warning("Could not read %s - is anything connected to HDMI?",
+                       DRM_MODES_SYSFS)
+    except Exception:
+        logger.exception("Error reading DRM modes")
+    return modes
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MPV PROCESS MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -448,6 +565,8 @@ def _build_mpv_cmd(path: str, loop: bool = False) -> list:
       --vo=drm                  DRM/KMS video output — works headless on RPi 5.
       --drm-device              Which DRM card to use.
       --drm-connector           Which connector (HDMI port) to output to.
+      --drm-mode                Output resolution.  Read from state so Web UI
+                                changes apply on the next mpv restart.
       --audio-device            ALSA device — read from state so Web UI changes
                                 take effect immediately after mpv restart.
       --audio-channels=stereo   Downmix any surround audio to stereo.
@@ -455,13 +574,14 @@ def _build_mpv_cmd(path: str, loop: bool = False) -> list:
       --really-quiet            Suppress verbose stdout; errors still logged.
     """
     with state_lock:
-        audio_dev = state.audio_device
+        audio_dev  = state.audio_device
+        resolution = state.resolution
     cmd = [
         "mpv",
         f"--vo=drm",
         f"--drm-device=/dev/dri/{DRM_DEVICE}",
         f"--drm-connector={DRM_CONNECTOR}",
-        "--drm-mode=preferred",       # use display's preferred mode, don't try to change it
+        f"--drm-mode={resolution}",   # "preferred", or a forced mode e.g. 1920x1080@50
         "--hwdec=auto-safe",          # use hardware decode where available
         f"--audio-device={audio_dev}",
         "--audio-channels=stereo",    # downmix 5.1 etc to stereo automatically
@@ -511,7 +631,13 @@ def _mpv_is_running() -> bool:
         return mpv_process is not None and mpv_process.poll() is None
 
 def _start_mpv(path: str, loop: bool = False):
-    """Start a fresh mpv process.  Used at startup and crash recovery only."""
+    """
+    Start a fresh mpv process.  Used at startup and crash recovery only.
+
+    Returns True if mpv came up and its IPC socket is ready.  Callers rely on
+    this to detect a forced display mode the screen will not accept, and to
+    fall back before the unit is left with no picture.
+    """
     global mpv_process
     logger.info("Starting mpv: %s (loop=%s)", path, loop)
     _terminate_mpv()
@@ -533,7 +659,7 @@ def _start_mpv(path: str, loop: bool = False):
             time.sleep(0.1)
         else:
             logger.warning("mpv IPC socket did not appear within 8 s")
-            return
+            return False
 
         with state_lock:
             state.current_video = os.path.basename(path)
@@ -546,6 +672,7 @@ def _start_mpv(path: str, loop: bool = False):
             daemon=True,
             name="mpv-stderr",
         ).start()
+        return True
 
     except FileNotFoundError:
         logger.exception("'mpv' not found — run: sudo apt install mpv")
@@ -553,6 +680,7 @@ def _start_mpv(path: str, loop: bool = False):
     except Exception:
         logger.exception("Failed to start mpv")
         mpv_process = None
+    return False
 
 def _drain_mpv_stderr(proc: subprocess.Popen):
     """Log any mpv stderr output and discard the rest."""
@@ -563,6 +691,55 @@ def _drain_mpv_stderr(proc: subprocess.Popen):
                 logger.debug("mpv: %s", txt)
     except Exception:
         pass
+
+def _apply_resolution(mode: str) -> Tuple[bool, str]:
+    """
+    Persist an output mode and restart mpv so --drm-mode takes effect.
+
+    Returns (applied_as_requested, active_mode).
+
+    If mpv will not come up on the requested mode, revert to RESOLUTION_DEFAULT
+    and persist that.  This matters more than it first looks: a forced mode the
+    display cannot actually do would otherwise leave a headless unit with no
+    picture AND the mpv watchdog restarting a process that can never succeed,
+    which is not recoverable without SSH access to the box.
+
+    Note the lock discipline.  state_lock is a plain, non-reentrant Lock, so it
+    is taken and released around each small update rather than held across the
+    mpv restart - holding it and then re-acquiring it in the finally block
+    would deadlock the player outright.
+    """
+    with state_lock:
+        previous            = state.resolution
+        state.resolution    = mode
+        state.restart_in_progress = True
+    save_resolution(mode)
+    logger.info("Output resolution set to %s — restarting mpv", mode)
+
+    ok       = False
+    reverted = False
+    try:
+        path, loop = _desired_video()
+        ok = _start_mpv(path, loop=loop)
+        if not ok and mode != RESOLUTION_DEFAULT:
+            logger.error(
+                "mpv would not start on mode %r (previously %r) — reverting to %s",
+                mode, previous, RESOLUTION_DEFAULT,
+            )
+            with state_lock:
+                state.resolution = RESOLUTION_DEFAULT
+            save_resolution(RESOLUTION_DEFAULT)
+            ok = _start_mpv(path, loop=loop)
+            reverted = True
+    except Exception:
+        logger.exception("Error applying resolution")
+    finally:
+        with state_lock:
+            state.restart_in_progress = False
+
+    with state_lock:
+        active = state.resolution
+    return (ok and not reverted, active)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MPV IPC — JSON SOCKET COMMANDS
@@ -1297,6 +1474,81 @@ async function loadAudioDevices(){
     st.textContent='Current: '+current;
   }catch(e){st.textContent='Could not load devices';}
 }
+/* A refresh rate can only be pinned to a real WxH mode, never to
+   "preferred"/"highest". Offered as a fixed list because sysfs reports the
+   resolutions a display supports but not the rates, so these are candidates
+   rather than a verified list - a combination the screen cannot do simply
+   fails to start and the player reverts on its own. */
+const RES_HZ_CHOICES=['Auto','24','25','30','50','60'];
+function isFixedMode(v){return /^[0-9]+x[0-9]+$/.test(v);}
+function syncHzEnabled(){
+  const sel=document.getElementById('resSel');
+  const hz=document.getElementById('resHz');
+  const on=isFixedMode(sel.value);
+  hz.disabled=!on;
+  if(!on)hz.value='Auto';
+}
+function resolutionValue(){
+  const base=document.getElementById('resSel').value;
+  const hz=document.getElementById('resHz').value;
+  if(!isFixedMode(base))return base;
+  return (hz==='Auto')?base:(base+'@'+hz);
+}
+async function loadDisplayModes(){
+  const sel=document.getElementById('resSel');
+  const hz=document.getElementById('resHz');
+  const st=document.getElementById('resSt');
+  try{
+    const d=await (await fetch('/display_modes')).json();
+    const modes=d.modes||[];
+    const cur=String(d.current||d.default);
+    const at=cur.indexOf('@');
+    const curBase=(at>=0)?cur.substring(0,at):cur;
+    const curHz=(at>=0)?cur.substring(at+1):'Auto';
+    sel.innerHTML='';
+    const opts=[{v:d.default,t:'Auto '+String.fromCharCode(8212)+' display preferred mode'}];
+    modes.forEach(m=>opts.push({v:m,t:m}));
+    if(curBase&&!opts.some(o=>o.v===curBase))opts.push({v:curBase,t:curBase+' (saved)'});
+    opts.forEach(o=>{
+      const e=document.createElement('option');
+      e.value=o.v;e.textContent=o.t;
+      if(o.v===curBase)e.selected=true;
+      sel.appendChild(e);
+    });
+    hz.innerHTML='';
+    const rates=RES_HZ_CHOICES.slice();
+    if(curHz!=='Auto'&&rates.indexOf(curHz)<0)rates.push(curHz);
+    rates.forEach(h=>{
+      const e=document.createElement('option');
+      e.value=h;
+      e.textContent=(h==='Auto')?'Auto (let the display choose)':(h+' Hz');
+      if(h===curHz)e.selected=true;
+      hz.appendChild(e);
+    });
+    syncHzEnabled();
+    st.textContent=modes.length
+      ? 'Current: '+cur
+      : 'Current: '+cur+' (could not read display modes '+String.fromCharCode(8212)+' is a screen connected?)';
+  }catch(e){st.textContent='Could not load display modes';}
+}
+async function applyResolution(){
+  const st=document.getElementById('resSt');
+  const want=resolutionValue();
+  st.textContent='Applying '+String.fromCharCode(8212)+' the picture will go black briefly...';
+  try{
+    const r=await fetch('/resolution',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({resolution:want})});
+    if(!r.ok){st.textContent='Error setting resolution';toast('Could not set resolution','err');return;}
+    const d=await r.json();
+    const hz=d.display_fps?('  ('+Math.round(d.display_fps)+' Hz)'):'';
+    if(d.reverted){
+      st.textContent='Rejected: '+want+' would not start '+String.fromCharCode(8212)+' reverted to '+d.resolution+hz;
+      toast(want+' not supported by this display '+String.fromCharCode(8212)+' reverted','err');
+    }else{
+      st.textContent='Active: '+d.resolution+hz;
+      toast('Output resolution set to '+d.resolution,'ok');
+    }
+  }catch(e){st.textContent='Request failed';}
+}
 async function applyAudioDevice(){
   const sel=document.getElementById('audioSel');
   const st=document.getElementById('audioSt');
@@ -1430,7 +1682,7 @@ async function doReboot(){
 
 window.onload=function(){
   fetchStatus();fetchVolume();fetchSysInfo();
-  fetchSlotStatus();loadAudioDevices();fetchPlayerName();fetchMaxUpload();
+  fetchSlotStatus();loadAudioDevices();loadDisplayModes();fetchPlayerName();fetchMaxUpload();
 }
 </script>
 </head>
@@ -1511,6 +1763,25 @@ window.onload=function(){
   <button class="btn btn-green btn-sm" onclick="applyAudioDevice()">Apply</button>
   <button class="btn btn-grey btn-sm" onclick="loadAudioDevices()" style="margin-left:6px">↺ Refresh</button>
   <div id="audioSt" style="font-size:0.82em;margin-top:6px;color:#155724"></div>
+</div>
+
+<!-- Output resolution -->
+<div class="card">
+  <h3>&#128250; Output Resolution</h3>
+  <p class="audio-hint">Forces the HDMI output mode. Only resolutions this display reports are listed.
+     Content here is PAL 25 fps, so 50 Hz divides evenly into the frame rate and 60 Hz does not &mdash;
+     if a clip judders on an otherwise clean file, try 50 Hz first.
+     Refresh rates are not reported by the display, so not every combination will exist; if one
+     will not start the player falls back to the display's preferred mode on its own.
+     Applying restarts the player, so the picture goes black for a second.
+     Selection persists across reboots.</p>
+  <label for="resSel" style="font-size:0.82em;color:#555">Resolution</label><br>
+  <select id="resSel" onchange="syncHzEnabled()" style="width:100%;max-width:340px;padding:5px;margin-bottom:8px"></select><br>
+  <label for="resHz" style="font-size:0.82em;color:#555">Refresh rate</label><br>
+  <select id="resHz" style="width:100%;max-width:340px;padding:5px;margin-bottom:8px"></select><br>
+  <button class="btn btn-green btn-sm" onclick="applyResolution()">Apply</button>
+  <button class="btn btn-grey btn-sm" onclick="loadDisplayModes()" style="margin-left:6px">&#8634; Refresh</button>
+  <div id="resSt" style="font-size:0.82em;margin-top:6px;color:#155724"></div>
 </div>
 
 <!-- ── Manage videos ── -->
@@ -1735,6 +2006,56 @@ def audio_device():
         return ("", 204)
     except Exception:
         logger.exception("Error in /audio_device POST")
+        return ("Bad request", 400)
+
+@app.route("/display_modes")
+def display_modes():
+    """
+    Modes the attached display advertises, for the UI dropdown.
+
+    An empty "modes" list means sysfs could not be read (usually nothing
+    plugged into HDMI), which the UI reports rather than presenting as
+    "no modes available".
+    """
+    with state_lock:
+        current = state.resolution
+    return jsonify({
+        "modes":   list_drm_modes(),
+        "current": current,
+        "default": RESOLUTION_DEFAULT,
+    })
+
+@app.route("/resolution", methods=["GET", "POST"])
+def resolution_route():
+    """
+    GET  — current output mode, plus the refresh rate mpv reports.
+    POST — force a mode, persist it, hot-restart mpv.
+
+    Reverts to the display's preferred mode automatically if mpv will not start
+    on the requested one, and says so in the response so the UI can tell the
+    user instead of silently doing something different.
+    """
+    if request.method == "GET":
+        with state_lock:
+            current = state.resolution
+        return jsonify({
+            "resolution":  current,
+            "display_fps": mpv_get_property("display-fps"),
+        })
+    try:
+        data = request.get_json(silent=True) or {}
+        mode = str(data.get("resolution", "")).strip()
+        if not RESOLUTION_RE.match(mode):
+            return ("Invalid resolution", 400)
+        ok, active = _apply_resolution(mode)
+        return jsonify({
+            "resolution":  active,
+            "requested":   mode,
+            "reverted":    (not ok),
+            "display_fps": mpv_get_property("display-fps"),
+        })
+    except Exception:
+        logger.exception("Error in /resolution POST")
         return ("Bad request", 400)
 
 @app.route("/set_override", methods=["POST"])
@@ -2074,21 +2395,36 @@ def log_watchdog(interval: float = LOG_CHECK_INTERVAL):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    logger.info("Stage Audio Works Video Player v5 (mpv + audio device selection) starting")
+    logger.info("Stage Audio Works Video Player v11 starting")
 
-    # Load saved volume and audio device into state before mpv starts
-    # so _build_mpv_cmd picks them both up.
+    # Load saved volume, audio device and output resolution into state before
+    # mpv starts so _build_mpv_cmd picks them all up.
     with state_lock:
         state.volume       = load_saved_volume()
         state.audio_device = load_saved_audio_device()
+        state.resolution   = load_saved_resolution()
+        boot_resolution    = state.resolution
     logger.info("Volume set to %s", state.volume)
     logger.info("Audio device set to %s", state.audio_device)
+    logger.info("Output resolution set to %s", state.resolution)
 
     # Start mpv with initial video
     try:
         path, loop = _desired_video()
         if os.path.exists(path):
-            _start_mpv(path, loop=loop)
+            if not _start_mpv(path, loop=loop) and boot_resolution != RESOLUTION_DEFAULT:
+                # A saved mode this display cannot do would otherwise leave the
+                # unit with no picture and the watchdog restarting mpv forever,
+                # with no way back short of SSH.  Revert and persist so the
+                # next boot is clean too.
+                logger.error(
+                    "mpv would not start on saved mode %r — reverting to %s",
+                    boot_resolution, RESOLUTION_DEFAULT,
+                )
+                with state_lock:
+                    state.resolution = RESOLUTION_DEFAULT
+                save_resolution(RESOLUTION_DEFAULT)
+                _start_mpv(path, loop=loop)
         else:
             logger.warning("Initial video not found: %s — waiting for upload", path)
     except Exception:

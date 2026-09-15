@@ -64,6 +64,10 @@ after install.
   returns to the loop.
 - **Override mode** replaces the loop with `override.mp4` and ignores buttons (for
   closures or private functions).
+- **Output resolution** can be forced from the web UI and persists across reboots.
+  Only modes the attached display actually reports are offered, and the player falls
+  back to the display's preferred mode automatically if it cannot start on the one
+  chosen — so a wrong pick cannot leave a unit with no picture.
 - Everything is configurable through a Flask web UI on port **5000**; the unit is also
   controllable over the network via UDP on port **5505**.
 
