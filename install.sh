@@ -295,6 +295,25 @@ else
     warn "docs/USER_MANUAL.pdf not found — the web UI's manual link opens GitHub instead"
 fi
 
+# The web UI's address on the console, above the login prompt - readable
+# without logging in, during the 30 s the player leaves the console on screen
+# after a boot. agetty fills in \n (hostname) and \4 (IPv4) and redraws it when
+# the address changes. Raspberry Pi OS's own /etc/issue.d/IP.issue already
+# prints the address; this adds the URL to type.
+ISSUE_FILE="/etc/issue.d/saw-player.issue"
+ISSUE_TMP="$(mktemp)"
+cat > "${ISSUE_TMP}" << 'ISSUEEOF'
+Stage Audio Works Video Player on \n - web UI: http://\4:5000
+
+ISSUEEOF
+if [[ -d /etc/issue.d ]] || mkdir -p /etc/issue.d; then
+    if ! cmp -s "${ISSUE_TMP}" "${ISSUE_FILE}"; then
+        install -m 644 -o root -g root "${ISSUE_TMP}" "${ISSUE_FILE}" \
+            && info "Console shows the web UI address → ${ISSUE_FILE}"
+    fi
+fi
+rm -f "${ISSUE_TMP}"
+
 info "Installing service file → ${SERVICE_DEST}"
 cp "${SERVICE_SRC}" "${SERVICE_DEST}" || error "Failed to copy service file"
 chmod 644 "${SERVICE_DEST}"

@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v14)
+Stage Audio Works Raspberry Pi Video Player  (v15)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -57,7 +57,10 @@ Features:
     keeps reconnecting - every 5 s for 20 attempts, then once a minute.
   • The user manual from the web UI (v14): a link at the top of the page and a
     Help link on each panel, opening the PDF installed on the unit - so it works
-    on a closed network - or the page on GitHub where there is none.
+    on a closed network - or the page on GitHub where there is none. The GitHub
+    update brings the published PDF along with the player (v15).
+  • After a boot, the console stays on screen for 30 s before the video starts
+    (v15), so the IP address it shows can be read without logging in.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -323,7 +326,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 14
+PLAYER_VERSION = 15
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -349,11 +352,20 @@ UPDATE_BRANCH     = "main"
 UPDATE_MANIFEST   = "release.json"
 UPDATE_TIMEOUT    = (6, 30)               # seconds: connect, read
 UPDATE_MAX_SCRIPT = 4 * 1024 * 1024       # refuse a download larger than this
+UPDATE_MANUAL     = "docs/USER_MANUAL.pdf"  # fixed here, never taken from release.json
+UPDATE_MAX_MANUAL = 32 * 1024 * 1024
 SERVICE_INSTALLED = "/etc/systemd/system/saw-player.service"
 # Test hook only: a base URL serving the same files, e.g. a staging copy. Set it
 # with a systemd drop-in (root only) - it is never taken from a web request.
 # Setting it also disables the GitHub API fallback.
 UPDATE_BASE_OVERRIDE = os.environ.get("SAW_UPDATE_BASE", "").strip()
+
+# ── Boot: the console stays on screen for a while (see the end of the file) ───
+# Long enough to read the IP address the console shows above its login prompt
+# (install.sh writes that line). Only after a boot: a restart of the player -
+# an update, a crash - takes the screen straight away.
+BOOT_CONSOLE_HOLD_S = 30
+BOOT_FRESH_S        = 120     # the system is this young: it has just booted
 
 # ── User manual (see USER MANUAL) ─────────────────────────────────────────────
 # The PDF the installer puts on the unit, first; then the copy in the one-line
@@ -3108,9 +3120,12 @@ def _validate_script(content: bytes) -> tuple[bool, str]:
 #   * It never downgrades. A unit running something newer than the published
 #     release (a test unit, say) is told so and left alone.
 #
-# What it installs: the player script only, through _deploy_script() - the same
-# validate / back up / atomic write / restart path as a manual upload. It does
-# NOT install saw-player.service or run the installer. Those need root, and
+# What it installs: the player script, through _deploy_script() - the same
+# validate / back up / atomic write / restart path as a manual upload - and,
+# from v15, the user manual PDF, checked against its own SHA-256 in
+# release.json and written to MANUAL_PDFS[0]. The manual is a document, never
+# run, and a failure with it never stops the player's update. It does NOT
+# install saw-player.service or run the installer. Those need root, and
 # granting root to an unauthenticated web page is not a trade worth making. If
 # a release changes the service file, the check says so and points at the
 # install one-liner.
@@ -3206,7 +3221,54 @@ def _update_manifest() -> dict:
     if size is not None and (not isinstance(size, int) or isinstance(size, bool)
                              or not 0 < size <= UPDATE_MAX_SCRIPT):
         raise UpdateError("%s has an invalid size" % UPDATE_MANIFEST)
+    # The manual's fields are optional (releases before v15 have none), and a
+    # bad one only means the manual is not updated - never the player.
+    msha, msize = m.get("manual_sha256"), m.get("manual_size")
+    if not (isinstance(msha, str) and re.fullmatch(r"[0-9a-f]{64}", msha)
+            and isinstance(msize, int) and not isinstance(msize, bool)
+            and 0 < msize <= UPDATE_MAX_MANUAL):
+        if msha is not None or msize is not None:
+            logger.warning("%s: the manual's checksum or size is not valid - the manual "
+                           "will not be updated", UPDATE_MANIFEST)
+        m.pop("manual_sha256", None)
+        m.pop("manual_size", None)
     return m
+
+
+def _update_manual(m: dict) -> str:
+    """
+    Bring the unit's manual PDF up to the published one, if release.json
+    describes it and it differs. Returns a few words for the operator. Never
+    raises: the manual must not stand in the way of the player's update.
+    """
+    want = m.get("manual_sha256")
+    if not want:
+        return ""
+    dest = MANUAL_PDFS[0]
+    if _sha256_file(dest) == want:
+        return "the manual is already current"
+    tmp = None
+    try:
+        content = _update_fetch(UPDATE_MANUAL, UPDATE_MAX_MANUAL)
+        if len(content) != m["manual_size"] or hashlib.sha256(content).hexdigest() != want:
+            raise UpdateError("the manual's checksum does not match %s" % UPDATE_MANIFEST)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), suffix=".manual.tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+        tmp = None
+        logger.info("User manual updated (%s, %d KB)", dest, len(content) // 1024)
+        return "the manual was updated"
+    except Exception as e:
+        logger.warning("User manual not updated: %s - the player update carries on", e)
+        return "the manual could not be updated (%s)" % e
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
 
 def _script_version(content: bytes):
@@ -3287,7 +3349,13 @@ def update_apply():
                               "nothing was changed" % (declared, UPDATE_MANIFEST, latest))
         logger.warning("Updating from v%d to v%d (published %s)",
                        PLAYER_VERSION, latest, m.get("released", "?"))
-        return _deploy_script(content, "GitHub release v%d" % latest)
+        # The manual first - _deploy_script restarts the service on success -
+        # but only for a script that will pass: a refused update changes nothing.
+        manual = _update_manual(m) if _validate_script(content)[0] else ""
+        ok, message, status = _deploy_script(content, "GitHub release v%d" % latest)
+        if ok and manual:
+            message = "%s; %s" % (message, manual)
+        return ok, message, status
     except UpdateError as e:
         logger.warning("Update not applied: %s", e)
         return False, str(e), 502
@@ -4467,8 +4535,9 @@ window.onload=function(){
   <div style="font-weight:600;font-size:0.9em;margin:0 0 4px">Update from GitHub</div>
   <p style="font-size:0.85em;color:#555;margin:0 0 8px">
     Checks the published release. If it is newer than this unit, it is downloaded, its checksum
-    verified, validated and installed, with the current version kept as a backup. The service
-    restarts (about 10s without video). Needs internet access to GitHub.
+    verified, validated and installed, with the current version kept as a backup, and the
+    user manual on this unit is brought up to date with it. The service restarts (about 10s
+    without video). Needs internet access to GitHub.
   </p>
   <button class="btn btn-blue btn-sm" id="updCheckBtn" onclick="checkUpdate()">Check for updates</button>
   <button class="btn btn-orange btn-sm" id="updApplyBtn" onclick="applyUpdate()" style="margin-left:6px;display:none">Update now</button>
@@ -5620,6 +5689,55 @@ def mpv_watchdog(interval: float = 5):
             logger.exception("mpv watchdog error")
             time.sleep(interval)
 
+def _uptime_s() -> Optional[float]:
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return None
+
+def boot_console_hold(uptime_s) -> int:
+    """Seconds to leave the console on screen before the video starts: the
+    whole hold just after a boot, none when the player is restarted later (an
+    update, a crash) or the uptime cannot be read."""
+    if isinstance(uptime_s, (int, float)) and not isinstance(uptime_s, bool) \
+            and 0 <= uptime_s < BOOT_FRESH_S:
+        return BOOT_CONSOLE_HOLD_S
+    return 0
+
+def _initial_start(boot_resolution: str):
+    """The first mpv start, with the auto-revert of a saved mode the display
+    cannot do (constraint 12)."""
+    try:
+        path, loop = _desired_video()
+        if os.path.exists(path):
+            if not _start_mpv(path, loop=loop) and boot_resolution != RESOLUTION_DEFAULT:
+                # A saved mode this display cannot do would otherwise leave the
+                # unit with no picture and the watchdog restarting mpv forever,
+                # with no way back short of SSH.  Revert and persist so the
+                # next boot is clean too.
+                logger.error(
+                    "mpv would not start on saved mode %r — reverting to %s",
+                    boot_resolution, RESOLUTION_DEFAULT,
+                )
+                with state_lock:
+                    state.resolution = RESOLUTION_DEFAULT
+                save_resolution(RESOLUTION_DEFAULT)
+                _start_mpv(path, loop=loop)
+        else:
+            logger.warning("Initial video not found: %s — waiting for upload", path)
+    except Exception:
+        logger.exception("Failed to start initial video")
+
+def _boot_hold_then_start(hold: float, boot_resolution: str):
+    time.sleep(hold)
+    try:
+        if not _mpv_is_running():          # nothing started it in the meantime
+            _initial_start(boot_resolution)
+    finally:
+        with state_lock:
+            state.restart_in_progress = False
+
 def log_watchdog(interval: float = LOG_CHECK_INTERVAL):
     logger.info("Log watchdog started")
     max_bytes = MAX_LOG_MB_BEFORE_ROTATE * 1024 * 1024
@@ -5651,27 +5769,21 @@ if __name__ == "__main__":
     logger.info("Audio device set to %s", state.audio_device)
     logger.info("Output resolution set to %s", state.resolution)
 
-    # Start mpv with initial video
-    try:
-        path, loop = _desired_video()
-        if os.path.exists(path):
-            if not _start_mpv(path, loop=loop) and boot_resolution != RESOLUTION_DEFAULT:
-                # A saved mode this display cannot do would otherwise leave the
-                # unit with no picture and the watchdog restarting mpv forever,
-                # with no way back short of SSH.  Revert and persist so the
-                # next boot is clean too.
-                logger.error(
-                    "mpv would not start on saved mode %r — reverting to %s",
-                    boot_resolution, RESOLUTION_DEFAULT,
-                )
-                with state_lock:
-                    state.resolution = RESOLUTION_DEFAULT
-                save_resolution(RESOLUTION_DEFAULT)
-                _start_mpv(path, loop=loop)
-        else:
-            logger.warning("Initial video not found: %s — waiting for upload", path)
-    except Exception:
-        logger.exception("Failed to start initial video")
+    # Start mpv with initial video - after a boot, only once the console has
+    # been on screen for BOOT_CONSOLE_HOLD_S, so its IP address can be read.
+    # The web UI is up meanwhile. restart_in_progress keeps the mpv watchdog
+    # and the triggers off until then; anything that starts mpv sooner (a
+    # change of audio output, say) simply ends the wait early.
+    hold = boot_console_hold(_uptime_s())
+    if hold:
+        logger.info("Just booted: the console stays on screen for %d s (IP address) "
+                    "before the video starts", hold)
+        with state_lock:
+            state.restart_in_progress = True
+        threading.Thread(target=_boot_hold_then_start, args=(hold, boot_resolution),
+                         daemon=True, name="boot-hold").start()
+    else:
+        _initial_start(boot_resolution)
 
     # Background threads
     for _target, _name in [

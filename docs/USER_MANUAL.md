@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v14**. Features that arrived in a recent version
+**Applies to:** software version **v15**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -165,6 +165,13 @@ Open a browser on the same network and go to:
 ```
 http://<pi-ip-address>:5000
 ```
+
+**Reading the address off the screen.** After the unit boots, its console stays on
+the display for **30 seconds** before the video starts (v15). Above the login
+prompt it shows the IP address and the web interface's address to type, for
+example `Stage Audio Works Video Player on gallery-2 - web UI: http://<its IP address>:5000`.
+No login is needed. The web interface is already up during those 30 seconds. A
+restart of the player alone (an update, say) does not wait; only a boot does.
 
 If the unit has been given a hostname, `http://<hostname>.local:5000` may also work,
 depending on the network.
@@ -330,7 +337,9 @@ software through the browser — no SSH needed. Two ways:
 **Update from GitHub** (v12). Press **Check for updates**. If a newer version has
 been published, it says so and offers **Update now**: the unit downloads it,
 checks its checksum, validates it as below and installs it, keeping the current
-version as a backup. The page reloads by itself once the new version is running.
+version as a backup. From v15 it also brings this manual on the unit up to date,
+checked the same way; if only the manual fails, the player is still updated. The
+page reloads by itself once the new version is running.
 It never installs an older version over a newer one, and needs internet access
 to GitHub — on a closed network the check says so and nothing changes.
 
@@ -431,7 +440,9 @@ This clones the project to `/home/pi/pi-video-player` and runs the installer.
 4. Writes the sudo rules the web interface needs for reboot and script update
 5. Puts this manual on the unit as `/home/pi/saw_manual.pdf`, for the web
    interface's **User manual** link (v14)
-6. Starts the service
+6. Adds the web interface's address to the console, above the login prompt
+   (v15) — see section 4.1
+7. Starts the service
 
 It is **non-interactive and safe to re-run** — every dependency is checked before
 installing, so a re-run is quick.
@@ -610,6 +621,7 @@ curl -X POST -H "Content-Type: application/json" \
 | Output resolution | `/home/pi/.mpv_resolution` |
 | Branding image | `/home/pi/saw.jpg` |
 | This manual | `/home/pi/saw_manual.pdf` |
+| Console line with the web interface's address | `/etc/issue.d/saw-player.issue` |
 | systemd service | `saw-player` |
 | Player control socket | `/tmp/saw_mpv.sock` |
 | Web interface | TCP 5000 |
@@ -1084,5 +1096,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v14.*
+*Stage Audio Works — Raspberry Pi Video Player, v15.*
 *This software is provided with no warranty and no support. See `README.md`.*

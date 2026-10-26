@@ -154,6 +154,21 @@ SUDOEOF
             || warn "  Could not install the user manual"
     fi
 
+    # ── The web UI's address on the console, above the login prompt ──────────
+    # As install.sh: agetty fills in \n and \4, and redraws it on a new address.
+    local issue_file="/etc/issue.d/saw-player.issue" issue_tmp
+    issue_tmp="$(mktemp)"
+    cat > "${issue_tmp}" << 'ISSUEEOF'
+Stage Audio Works Video Player on \n - web UI: http://\4:5000
+
+ISSUEEOF
+    mkdir -p /etc/issue.d
+    if ! cmp -s "${issue_tmp}" "${issue_file}"; then
+        install -m 644 -o root -g root "${issue_tmp}" "${issue_file}" \
+            && info "  ✅  Console shows the web UI address → ${issue_file}"
+    fi
+    rm -f "${issue_tmp}"
+
     # NOTE: this used to inject Environment=GPIOZERO_PIN_FACTORY=lgpio into the
     # service file. That was removed — gpiozero is not used (the player calls
     # lgpio directly), and re-adding a line that is no longer in the repo's
