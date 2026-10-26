@@ -29,7 +29,9 @@
 #   1. Installs dependencies (mpv, Python packages, Bluetooth audio, watchdog)
 #   2. Creates directories and installs the player script + systemd service
 #   3. Configures the Raspberry Pi hardware watchdog
-#   4. Writes the sudoers rules the web UI needs, then starts the service
+#   4. Writes the sudoers rules the web UI needs, puts in place what lets the
+#      web UI install AES67 (it installs nothing itself - see
+#      aes67-webinstall.sh), then starts the service
 #
 # What this script deliberately does NOT do:
 #   Hostname and static-IP configuration. That is a separate concern — see
@@ -108,6 +110,11 @@ if [[ "${DO_UNINSTALL}" == true ]]; then
     systemctl stop    watchdog 2>/dev/null || true
     systemctl disable watchdog 2>/dev/null || true
     systemctl daemon-reload
+    # The web UI's way into the AES67 installer. AES67 itself, if installed, has
+    # its own: sudo bash install-aes67.sh --uninstall
+    rm -f /etc/sudoers.d/saw-aes67-webinstall /usr/local/sbin/saw-aes67-webinstall \
+          /etc/sudoers.d/saw-bluetooth
+    rm -rf /usr/local/lib/saw-aes67
     info "Service and watchdog removed."
     info "Player script, videos, and logs were left in place. To remove them:"
     info "  rm -rf ${PLAYER_DEST} ${VIDEO_DIR} ${LOG_FILE}"
@@ -177,13 +184,15 @@ install_python_pkg "flask"    "python3-flask"
 install_python_pkg "requests" "python3-requests"
 
 # ── Bluetooth audio (bluez + bluez-alsa) ─────────────────────────────────────
-# bluez            — pairing, trusting, connecting (bluetoothctl)
-# bluez-alsa-utils — exposes each connected A2DP device as an ALSA PCM named
-#                    bluealsa:DEV=AA:BB:CC:DD:EE:FF,PROFILE=a2dp, so mpv can
-#                    target it with the same --audio-device flag it already
-#                    uses for HDMI and USB output.
-# Bluetooth is currently deprioritised and untested on hardware, so every step
-# here is non-fatal: a failure must not block a working HDMI-audio install.
+# bluez                   — pairing, trusting, connecting (bluetoothctl)
+# bluez-alsa-utils        — the bluealsa daemon: each connected A2DP speaker
+#                           becomes an ALSA PCM, so mpv reaches it with the same
+#                           --audio-device flag it uses for HDMI and USB
+# libasound2-plugin-bluez — the ALSA side of that (the "bluealsa" PCM).
+#                           bluez-alsa-utils depends on it; named anyway, as it
+#                           is the part mpv actually opens.
+# Installed on every unit but switched on from the web UI only (v12 change 4).
+# Every step is non-fatal: Bluetooth must never block a working install.
 info "Checking Bluetooth audio support..."
 
 if ! command -v bluetoothctl &>/dev/null; then
@@ -193,23 +202,25 @@ else
     info "  bluez already installed"
 fi
 
-if ! dpkg -s bluez-alsa-utils &>/dev/null 2>&1; then
-    warn "bluez-alsa-utils not found — installing..."
-    apt-get install -y bluez-alsa-utils \
-        || warn "Could not install bluez-alsa-utils — Bluetooth audio output will not work"
-else
-    info "  bluez-alsa-utils already installed"
-fi
+for pkg in bluez-alsa-utils libasound2-plugin-bluez; do
+    if ! dpkg -s "${pkg}" &>/dev/null; then
+        warn "${pkg} not found — installing..."
+        apt-get install -y "${pkg}" \
+            || warn "Could not install ${pkg} — Bluetooth audio output will not work"
+    else
+        info "  ${pkg} already installed"
+    fi
+done
 
 if systemctl list-unit-files 2>/dev/null | grep -q "^bluetooth.service"; then
-    systemctl enable bluetooth &>/dev/null || true
-    systemctl start  bluetooth &>/dev/null || true
+    systemctl enable --now bluetooth &>/dev/null || true
     info "  bluetooth.service enabled"
 fi
 
+# enable --now, never restart: a re-run (the one-liner is also the update path)
+# must not cut off a speaker that is playing.
 if systemctl list-unit-files 2>/dev/null | grep -q "^bluealsa.service"; then
-    systemctl enable  bluealsa &>/dev/null || true
-    systemctl restart bluealsa &>/dev/null || true
+    systemctl enable --now bluealsa &>/dev/null || true
     if systemctl is-active --quiet bluealsa; then
         info "  ✅  bluealsa.service running (Bluetooth audio ready)"
     else
@@ -226,6 +237,25 @@ if ! id -nG pi 2>/dev/null | grep -qw bluetooth; then
         || warn "  Could not add pi to bluetooth group"
 else
     info "  pi is already in the bluetooth group"
+fi
+
+# A radio blocked by rfkill cannot be powered on from bluetoothctl. Unblock it
+# now, and let the player do the same later (an rfkill state can come back
+# after an image is cloned) through one sudo rule for exactly that command,
+# checked by visudo before it goes live.
+if RFKILL="$(command -v rfkill)"; then
+    "${RFKILL}" unblock bluetooth &>/dev/null || true
+    BT_TMP="$(mktemp)"
+    cat > "${BT_TMP}" << SUDOEOF
+# Written by install.sh - lets the player unblock the Bluetooth radio, nothing else.
+pi ALL=(root) NOPASSWD: ${RFKILL} unblock bluetooth
+SUDOEOF
+    if visudo -cf "${BT_TMP}" >/dev/null 2>&1; then
+        install -m 440 -o root -g root "${BT_TMP}" /etc/sudoers.d/saw-bluetooth
+    else
+        warn "  Bluetooth rfkill sudo rule failed visudo's check - not installed"
+    fi
+    rm -f "${BT_TMP}"
 fi
 
 # ── watchdog daemon (userspace helper — the kernel module is separate) ────────
@@ -397,6 +427,41 @@ SUDOEOF
     info "  ✅  Sudoers rules written"
 else
     info "Sudoers rules already present — skipping"
+fi
+
+# Installing AES67 from the web UI (optional, experimental). Puts root-owned
+# copies of the AES67 installer and the bridge source in place, the wrapper
+# that starts them, and one sudo rule allowing user pi exactly two commands -
+# see aes67-webinstall.sh. Nothing runs until somebody presses Install. The
+# copies are root-owned on purpose: user pi can edit /home/pi, so running the
+# checkout as root would hand pi root. Refreshed on every run, so the one-liner
+# is also how a unit gets a newer AES67 installer.
+AES67_LIB="/usr/local/lib/saw-aes67"
+AES67_WRAPPER="/usr/local/sbin/saw-aes67-webinstall"
+AES67_SUDOERS="/etc/sudoers.d/saw-aes67-webinstall"
+if [[ -f "${SCRIPT_DIR}/install-aes67.sh" && -f "${SCRIPT_DIR}/aes67-webinstall.sh" \
+      && -f "${SCRIPT_DIR}/aes67-bridge/saw-aes67-bridge.c" ]]; then
+    rm -rf "${AES67_LIB}"
+    install -d -m 755 -o root -g root "${AES67_LIB}/aes67-bridge"
+    install -m 644 -o root -g root "${SCRIPT_DIR}/install-aes67.sh" "${AES67_LIB}/install-aes67.sh"
+    install -m 644 -o root -g root "${SCRIPT_DIR}"/aes67-bridge/*.[ch] "${AES67_LIB}/aes67-bridge/"
+    install -m 755 -o root -g root "${SCRIPT_DIR}/aes67-webinstall.sh" "${AES67_WRAPPER}"
+    # Checked with visudo before it goes live: a sudoers file with a syntax
+    # error breaks sudo for every user on the box.
+    AES67_TMP="$(mktemp)"
+    cat > "${AES67_TMP}" << SUDOEOF
+# Written by install.sh - lets the web UI start the AES67 installer, nothing else.
+pi ALL=(root) NOPASSWD: ${AES67_WRAPPER} start keep, ${AES67_WRAPPER} start dark
+SUDOEOF
+    if visudo -cf "${AES67_TMP}" >/dev/null 2>&1; then
+        install -m 440 -o root -g root "${AES67_TMP}" "${AES67_SUDOERS}"
+        info "AES67 can be installed from the web UI"
+    else
+        warn "AES67 sudo rule failed visudo's check - not installed; AES67 can still be installed over SSH"
+    fi
+    rm -f "${AES67_TMP}"
+else
+    warn "AES67 files not found next to install.sh - installing AES67 from the web UI will not be offered"
 fi
 
 info "Starting ${SERVICE_NAME} service..."

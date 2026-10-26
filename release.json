@@ -1,0 +1,9 @@
+{
+  "version": 12,
+  "file": "RPi_Video_Player_v12.py",
+  "sha256": "77154f060d6b6621f3811a82b329d879cf3e1c52d4579ef95522e6476ff91234",
+  "size": 252764,
+  "service_sha256": "fa4e720fcc95b587f3b1c7cc51705b465741c8e5b981acb94bfab07ab152a28f",
+  "released": "2026-10-26T09:18:50Z",
+  "source_commit": "deeb743"
+}

@@ -137,14 +137,14 @@ SUDOEOF
         info "Bluetooth: bluez is installed"
 
         if systemctl list-unit-files 2>/dev/null | grep -q "^bluetooth.service"; then
-            systemctl enable bluetooth &>/dev/null || true
-            systemctl start  bluetooth &>/dev/null || true
+            systemctl enable --now bluetooth &>/dev/null || true
         fi
 
+        # enable --now, never restart: this runs on every update and must not
+        # cut off a speaker that is playing.
         if dpkg -s bluez-alsa-utils &>/dev/null 2>&1 \
            || systemctl list-unit-files 2>/dev/null | grep -q "^bluealsa.service"; then
-            systemctl enable  bluealsa &>/dev/null || true
-            systemctl restart bluealsa &>/dev/null || true
+            systemctl enable --now bluealsa &>/dev/null || true
             if systemctl is-active --quiet bluealsa; then
                 info "  ✅  bluealsa running — Bluetooth audio ready"
             else

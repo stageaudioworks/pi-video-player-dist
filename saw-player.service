@@ -35,6 +35,11 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 # lgpio directly (gpiozero throws BadPinFactory under systemd on the Pi 5).
 
 # ── Resource limits ───────────────────────────────────────────────────────
+# Lets the player lock its video clips into RAM (RAM PINNING in the player
+# script). The player budgets this itself against available memory and always
+# leaves headroom for the system, so this limit is not the safeguard. Without
+# it the lock limit is only a few MB and pinning reports itself as limited.
+LimitMEMLOCK=infinity
 IOSchedulingClass=best-effort
 IOSchedulingPriority=2
 CPUSchedulingPolicy=rr

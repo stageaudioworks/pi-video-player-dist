@@ -37,3 +37,4 @@
 *.gz   binary
 *.zip  binary
 *.docx binary
+*.pdf  binary
