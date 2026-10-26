@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v15)
+Stage Audio Works Raspberry Pi Video Player  (v16)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -61,6 +61,9 @@ Features:
     update brings the published PDF along with the player (v15).
   • After a boot, the console stays on screen for 30 s before the video starts
     (v15), so the IP address it shows can be read without logging in.
+  • No screen connected (switched off, unplugged): the player says so once, in
+    the log and the web UI, and starts the video by itself when one appears
+    (v16) - instead of restarting mpv every 5 s and logging each attempt.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -206,6 +209,16 @@ OVERRIDE_VIDEO_DEFAULT = os.path.join(VIDEO_DIR, "override.mp4")
 # Confirmed by:  cat /sys/class/drm/card1-HDMI-A-1/status
 DRM_DEVICE    = "card1"
 DRM_CONNECTOR = "HDMI-A-1"
+DRM_STATUS    = "/sys/class/drm/%s-%s/status" % (DRM_DEVICE, DRM_CONNECTOR)
+
+# ── mpv watchdog logging (see mpv_watchdog) ───────────────────────────────────
+# A restart that does not stay up MPV_STAYS_UP_S is a quick failure. From the
+# MPV_QUIET_AFTER-th in a row the watchdog keeps retrying but stops logging each
+# one - a line every MPV_QUIET_LOG_S instead - so a fault that outlasts anyone
+# watching cannot fill the SD card (it used to write ~70,000 lines a day).
+MPV_STAYS_UP_S  = 30
+MPV_QUIET_AFTER = 3
+MPV_QUIET_LOG_S = 600
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
 # Default device used on first boot (before user selects one via the Web UI).
@@ -326,7 +339,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 15
+PLAYER_VERSION = 16
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -2413,14 +2426,14 @@ def _mpv_audio_args(audio_dev: str) -> list:
         f"--audio-delay={delay:.3f}",
     ]
 
-def _terminate_mpv():
+def _terminate_mpv(quiet: bool = False):
     global mpv_process
     with mpv_lock:
         proc = mpv_process
         if proc is None:
             return
         try:
-            logger.info("Terminating mpv pid=%s", proc.pid)
+            (logger.debug if quiet else logger.info)("Terminating mpv pid=%s", proc.pid)
             proc.terminate()
             try:
                 proc.wait(timeout=4)
@@ -2445,17 +2458,20 @@ def _mpv_is_running() -> bool:
     with mpv_lock:
         return mpv_process is not None and mpv_process.poll() is None
 
-def _start_mpv(path: str, loop: bool = False):
+def _start_mpv(path: str, loop: bool = False, quiet: bool = False):
     """
     Start a fresh mpv process.  Used at startup and crash recovery only.
 
     Returns True if mpv came up and its IPC socket is ready.  Callers rely on
     this to detect a forced display mode the screen will not accept, and to
     fall back before the unit is left with no picture.
+
+    quiet: the watchdog's repeated restarts - the routine lines go to DEBUG.
     """
     global mpv_process
-    logger.info("Starting mpv: %s (loop=%s)", path, loop)
-    _terminate_mpv()
+    say = logger.debug if quiet else logger.info
+    say("Starting mpv: %s (loop=%s)", path, loop)
+    _terminate_mpv(quiet=quiet)
     time.sleep(0.1)
     cmd = _build_mpv_cmd(path, loop=loop)
     try:
@@ -2473,12 +2489,12 @@ def _start_mpv(path: str, loop: bool = False):
                 break
             time.sleep(0.1)
         else:
-            logger.warning("mpv IPC socket did not appear within 8 s")
+            (logger.debug if quiet else logger.warning)("mpv IPC socket did not appear within 8 s")
             return False
 
         with state_lock:
             state.current_video = os.path.basename(path)
-        logger.info("mpv started and IPC socket ready")
+        say("mpv started and IPC socket ready")
 
         # Start a thread to drain stderr so the pipe buffer never fills
         threading.Thread(
@@ -3518,7 +3534,11 @@ async function fetchStatus(){
   try{
     const d=await(await fetch('/status')).json();
     document.getElementById('sv').textContent=d.video;
-    document.getElementById('ss').textContent=d.state;
+    const ss=document.getElementById('ss');
+    if(d.display===false&&d.state!=='playing'){
+      ss.textContent='no screen connected ('+d.connector+') - the video starts when one is switched on or plugged in';
+      ss.style.color='#b06d00';
+    }else{ss.textContent=d.state;ss.style.color='';}
     document.getElementById('sp').textContent=d.position;
     document.getElementById('sr').textContent=d.remaining;
     document.getElementById('overrideCheckbox').checked=!!d.override_active;
@@ -4671,6 +4691,8 @@ def status():
         "remaining":       time.strftime("%H:%M:%S", time.gmtime(max(0, length - pos))),
         "override_active": override_active,
         "volume":          st.get("volume", state.volume),
+        "display":         display_connected(),      # False: no screen - nothing to play on
+        "connector":       DRM_CONNECTOR,
     })
 
 @app.route("/volume", methods=["GET", "POST"])
@@ -5659,14 +5681,77 @@ ram_pinner = RamPinner()
 # WATCHDOGS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def display_connected(path: Optional[str] = None) -> Optional[bool]:
+    """
+    Whether a screen is on the player's HDMI connector, from the kernel's own
+    status file: True, False, or None when it cannot be told (unreadable, or
+    "unknown") - and then the player starts mpv as it always has. A screen
+    that is off often reads as disconnected: TVs in standby drop the signal
+    that tells the Pi they are there.
+    """
+    try:
+        with open(path or DRM_STATUS) as f:
+            st = f.read().strip()
+    except Exception:
+        return None
+    return {"connected": True, "disconnected": False}.get(st)
+
+class MpvRestartLog:
+    """What the mpv watchdog logs, decided apart from the watchdog so it can be
+    tested on a fake clock. Restarts that do not stay up go quiet from the
+    MPV_QUIET_AFTER-th in a row - a summary every MPV_QUIET_LOG_S instead - and
+    a line says when mpv has stayed up again."""
+
+    def __init__(self):
+        self.fails, self.last_start, self.last_summary = 0, None, 0.0
+
+    def before_restart(self, now: float):
+        """(quiet, line to log or None) for a restart about to happen."""
+        quick = self.last_start is not None and now - self.last_start < MPV_STAYS_UP_S
+        self.fails = self.fails + 1 if quick else 0
+        if self.fails < MPV_QUIET_AFTER:
+            return False, "Watchdog: mpv is down — restarting"
+        if self.fails == MPV_QUIET_AFTER:
+            self.last_summary = now
+            return True, ("Watchdog: mpv keeps exiting straight after it starts (%d times in a "
+                          "row) - still retrying, but logging only every %d minutes"
+                          % (self.fails, MPV_QUIET_LOG_S // 60))
+        if now - self.last_summary >= MPV_QUIET_LOG_S:
+            self.last_summary = now
+            return True, ("Watchdog: mpv still exits straight after it starts (%d restarts so far)"
+                          % self.fails)
+        return True, None
+
+    def started(self, now: float):
+        self.last_start = now
+
+    def running(self, now: float):
+        """A line to log once mpv has stayed up after quick failures, else None."""
+        if (self.fails >= MPV_QUIET_AFTER and self.last_start is not None
+                and now - self.last_start >= MPV_STAYS_UP_S):
+            n, self.fails = self.fails, 0
+            return "Watchdog: mpv has stayed up again, after %d quick restarts" % n
+        return None
+
+    def reset(self):
+        self.fails, self.last_start = 0, None
+
 def mpv_watchdog(interval: float = 5):
     logger.info("mpv watchdog started (interval=%ss)", interval)
     missing = None      # the clip logged as missing, so it is said once, not every 5 s
+    no_display = False  # likewise "no screen connected"
+    restarts = MpvRestartLog()
     while True:
         try:
             with state_lock:
                 restarting = state.restart_in_progress
-            if not restarting and not _mpv_is_running():
+            if restarting:
+                pass
+            elif _mpv_is_running():
+                line = restarts.running(time.monotonic())
+                if line:
+                    logger.info(line)
+            else:
                 path, loop = _desired_video()
                 if not os.path.exists(path):
                     # mpv would exit at once, and be restarted again and again
@@ -5674,14 +5759,29 @@ def mpv_watchdog(interval: float = 5):
                     if missing != path:
                         logger.warning("Watchdog: %s is missing - mpv waits until it is uploaded", path)
                         missing = path
+                elif display_connected() is False:
+                    # Nothing to play on: mpv would exit at once, every time.
+                    # Plugging in or switching on the screen ends the wait.
+                    if not no_display:
+                        logger.warning("Watchdog: no screen connected on %s - the video starts by "
+                                       "itself when one is switched on or plugged in", DRM_CONNECTOR)
+                        no_display = True
+                        restarts.reset()
                 else:
                     missing = None
-                    logger.warning("Watchdog: mpv is down — restarting")
+                    came_back = no_display
+                    if no_display:
+                        logger.info("Watchdog: screen connected on %s - starting the video", DRM_CONNECTOR)
+                        no_display = False
+                    quiet, line = restarts.before_restart(time.monotonic())
+                    if line and not came_back:      # the line above already said it
+                        logger.warning(line)
                     with state_lock:
                         state.restart_in_progress = True
                     try:
-                        _start_mpv(path, loop=loop)
+                        _start_mpv(path, loop=loop, quiet=quiet)
                     finally:
+                        restarts.started(time.monotonic())
                         with state_lock:
                             state.restart_in_progress = False
             time.sleep(interval)
@@ -5710,7 +5810,13 @@ def _initial_start(boot_resolution: str):
     cannot do (constraint 12)."""
     try:
         path, loop = _desired_video()
-        if os.path.exists(path):
+        if display_connected() is False:
+            # Not even tried: with no screen mpv fails whatever the mode, and
+            # the revert below would throw away a mode that works perfectly
+            # well once the screen is on. The watchdog starts it then.
+            logger.info("No screen connected on %s yet - the video starts when one appears",
+                        DRM_CONNECTOR)
+        elif os.path.exists(path):
             if not _start_mpv(path, loop=loop) and boot_resolution != RESOLUTION_DEFAULT:
                 # A saved mode this display cannot do would otherwise leave the
                 # unit with no picture and the watchdog restarting mpv forever,

@@ -106,8 +106,16 @@ if [[ -d "${CLONE_DIR}/.git" ]]; then
 
     info "  ✅  Updated to $(git "${GIT_OPTS[@]}" -C "${CLONE_DIR}" rev-parse --short HEAD)"
 else
+    if [[ -e "${CLONE_DIR}" ]]; then
+        # Something is there but it is not a checkout - project files copied
+        # across by hand for update.sh, say. Moved aside, never deleted: what
+        # is in it may be the only copy.
+        ASIDE="${CLONE_DIR}.old-$(date +%Y%m%d-%H%M%S)"
+        mv "${CLONE_DIR}" "${ASIDE}" \
+            || error "Could not move ${CLONE_DIR} aside - nothing was changed. Move it by hand, then run this again."
+        warn "${CLONE_DIR} was not a git checkout - moved aside to ${ASIDE} (nothing deleted)"
+    fi
     info "Cloning..."
-    rm -rf "${CLONE_DIR}"
     git "${GIT_OPTS[@]}" clone --branch "${BRANCH}" "${REPO_URL}" "${CLONE_DIR}" \
         || error "git clone failed. If the repo is still private, set SAW_GIT_TOKEN (see the header of this script)."
     info "  ✅  Cloned at $(git "${GIT_OPTS[@]}" -C "${CLONE_DIR}" rev-parse --short HEAD)"

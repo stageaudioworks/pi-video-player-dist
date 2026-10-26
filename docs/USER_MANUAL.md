@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v15**. Features that arrived in a recent version
+**Applies to:** software version **v16**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -199,6 +199,12 @@ easier to tell several open browser tabs apart when managing a fleet.
 
 Pause is a genuine pause — the frame stays on screen. It does not survive a reboot.
 
+**"No screen connected."** When the status line says this, the Pi cannot see a
+screen on HDMI port 0 — it is switched off, unplugged, or on the other port. Many
+screens in standby look unplugged to the Pi. Nothing is wrong with the player: the
+video starts by itself within a few seconds of the screen being switched on or
+plugged in (v16). The log says so once rather than every few seconds.
+
 ### 4.4 Volume
 
 The volume slider runs 0–100 and takes effect immediately. The setting **persists
@@ -337,9 +343,12 @@ software through the browser — no SSH needed. Two ways:
 **Update from GitHub** (v12). Press **Check for updates**. If a newer version has
 been published, it says so and offers **Update now**: the unit downloads it,
 checks its checksum, validates it as below and installs it, keeping the current
-version as a backup. From v15 it also brings this manual on the unit up to date,
-checked the same way; if only the manual fails, the player is still updated. The
-page reloads by itself once the new version is running.
+version as a backup. A unit already running v15 or later also brings this manual
+up to date, checked the same way; if only the manual fails, the player is still
+updated. (The update is done by the version being replaced, so updating *to* v15
+does not bring the manual yet — run the one-line installer once, section 7.2.)
+The manual only travels with a new version: if the version has not changed, the
+unit keeps its copy. The page reloads by itself once the new version is running.
 It never installs an older version over a newer one, and needs internet access
 to GitHub — on a closed network the check says so and nothing changes.
 
@@ -679,7 +688,7 @@ ip -s link show eth0                          # network error counters
 
 | Symptom | Check in this order |
 |---|---|
-| **No picture at all** | Power supply (`dmesg \| grep -i volt`) → is the service running → does `loop.mp4` exist (without it the player waits for an upload, and says so in the log) → is mpv running → was the display connected and powered on *before* the Pi booted |
+| **No picture at all** | The web interface's status says **no screen connected** → switch the screen on, check the cable is in HDMI port 0 (`cat /sys/class/drm/card1-HDMI-A-1/status` should say `connected`) → power supply (`dmesg \| grep -i volt`) → is the service running → does `loop.mp4` exist (without it the player waits for an upload, and says so in the log) → is mpv running |
 | **Buttons do nothing** | Override mode is on (by far the most common) → trigger file missing → a clip is already playing → wiring between GPIO pin and ground |
 | **Web page loads but every field shows a dash** | A JavaScript error is stopping the page. Open the browser console. Usually follows a bad script deployment — roll back with the `.bak` file. |
 | **No audio** | Audio device selection → volume slider not at zero → the physical output the display or amplifier is actually using → `aplay -l` shows the device |
@@ -1096,5 +1105,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v15.*
+*Stage Audio Works — Raspberry Pi Video Player, v16.*
 *This software is provided with no warranty and no support. See `README.md`.*
