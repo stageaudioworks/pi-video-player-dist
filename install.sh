@@ -283,6 +283,18 @@ cp "${PLAYER_SRC}" "${PLAYER_DEST}" || error "Failed to copy player script"
 chown pi:pi "${PLAYER_DEST}"
 chmod 755   "${PLAYER_DEST}"
 
+# The user manual, for the web UI's "User manual" and Help links. On the unit,
+# so it opens on a closed network; without it the links go to GitHub.
+MANUAL_SRC="${SCRIPT_DIR}/docs/USER_MANUAL.pdf"
+MANUAL_DEST="/home/pi/saw_manual.pdf"
+if [[ -f "${MANUAL_SRC}" ]]; then
+    install -m 644 -o pi -g pi "${MANUAL_SRC}" "${MANUAL_DEST}" \
+        && info "Installing user manual → ${MANUAL_DEST}" \
+        || warn "Could not install the user manual — the web UI's link opens GitHub instead"
+else
+    warn "docs/USER_MANUAL.pdf not found — the web UI's manual link opens GitHub instead"
+fi
+
 info "Installing service file → ${SERVICE_DEST}"
 cp "${SERVICE_SRC}" "${SERVICE_DEST}" || error "Failed to copy service file"
 chmod 644 "${SERVICE_DEST}"

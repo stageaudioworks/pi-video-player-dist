@@ -141,6 +141,19 @@ SUDOEOF
         info "  ✅  removed"
     fi
 
+    # ── The user manual, for the web UI's "User manual" and Help links ────────
+    # Read by the player on each request, so no restart. Found in docs/ (a
+    # checkout) or next to this script (files copied across flat).
+    local manual_src="" manual_dest="/home/pi/saw_manual.pdf" m
+    for m in "${SCRIPT_DIR}/docs/USER_MANUAL.pdf" "${SCRIPT_DIR}/USER_MANUAL.pdf"; do
+        [[ -f "${m}" ]] && { manual_src="${m}"; break; }
+    done
+    if [[ -n "${manual_src}" ]] && ! cmp -s "${manual_src}" "${manual_dest}"; then
+        install -m 644 -o pi -g pi "${manual_src}" "${manual_dest}" \
+            && info "  ✅  User manual updated → ${manual_dest}" \
+            || warn "  Could not install the user manual"
+    fi
+
     # NOTE: this used to inject Environment=GPIOZERO_PIN_FACTORY=lgpio into the
     # service file. That was removed — gpiozero is not used (the player calls
     # lgpio directly), and re-adding a line that is no longer in the repo's

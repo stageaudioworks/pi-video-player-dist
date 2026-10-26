@@ -205,6 +205,14 @@ sound card until the installer is run again. `--help` lists the options;
 Not handled by the installer. Set the hostname and IP with Raspberry Pi Imager, a DHCP
 reservation, or `raspi-config` / `nmcli`.
 
+## User manual
+
+[`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) — operation, installation, UDP and HTTP
+control, AES67, Bluetooth and fault-finding — with a PDF copy beside it. The web
+interface opens it too: **User manual** at the top of the page, and **? Help** on each
+panel for the section about that panel. It opens the copy installed on the unit, so
+it works without internet access.
+
 ## Diagnostics
 
 ```bash
@@ -222,7 +230,7 @@ cat /run/saw-aes67/bridge.json              # the bridge's view: PTP, card, drif
 
 ## Project state
 
-- `RPi_Video_Player_v13.py` — **current version.**
+- `RPi_Video_Player_v14.py` — **current version.**
 
 ## License
 

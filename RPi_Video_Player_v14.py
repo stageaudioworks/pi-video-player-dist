@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v13)
+Stage Audio Works Raspberry Pi Video Player  (v14)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -55,6 +55,9 @@ Features:
     speaker as the audio output, forget it, turn Bluetooth off. The chosen
     speaker reconnects after a reboot, and whenever it drops out the player
     keeps reconnecting - every 5 s for 20 attempts, then once a minute.
+  • The user manual from the web UI (v14): a link at the top of the page and a
+    Help link on each panel, opening the PDF installed on the unit - so it works
+    on a closed network - or the page on GitHub where there is none.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -94,6 +97,11 @@ Display endpoints:
   /resolution    GET  — current output mode + refresh rate mpv reports
   /resolution    POST — force a mode, persist, hot-restart mpv; reverts to
                         "preferred" automatically if mpv will not start on it
+
+User manual endpoints:
+  /manual         GET  — the manual: the PDF on this unit, else GitHub's page.
+                         ?section=aes67 (etc.) opens a section, ?online=1 GitHub
+  /manual.pdf     GET  — the PDF on this unit
 
 Software update endpoints:
   /update/version GET  — installed version
@@ -315,7 +323,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 13
+PLAYER_VERSION = 14
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -346,6 +354,24 @@ SERVICE_INSTALLED = "/etc/systemd/system/saw-player.service"
 # with a systemd drop-in (root only) - it is never taken from a web request.
 # Setting it also disables the GitHub API fallback.
 UPDATE_BASE_OVERRIDE = os.environ.get("SAW_UPDATE_BASE", "").strip()
+
+# ── User manual (see USER MANUAL) ─────────────────────────────────────────────
+# The PDF the installer puts on the unit, first; then the copy in the one-line
+# installer's checkout. Neither: the page on GitHub.
+MANUAL_PDFS       = ["/home/pi/saw_manual.pdf",
+                     "/home/pi/pi-video-player/docs/USER_MANUAL.pdf"]
+MANUAL_ONLINE     = "https://github.com/%s/blob/%s/docs/USER_MANUAL.md" % (UPDATE_REPO, UPDATE_BRANCH)
+# The sections the web UI's Help links open: the PDF's named destination
+# (tools/build_manual_pdf.py names them sec<number>), and GitHub's anchor.
+MANUAL_SECTIONS   = {
+    "system":     ("sec4.9",  "49-system-panel"),
+    "audio":      ("sec4.8",  "48-audio-output"),
+    "resolution": ("sec4.7",  "47-output-resolution-and-refresh-rate"),
+    "videos":     ("sec4.6",  "46-managing-videos"),
+    "update":     ("sec7",    "7-updating-an-existing-unit"),
+    "aes67":      ("sec13",   "13-aes67-network-audio-optional"),
+    "bluetooth":  ("sec14",   "14-bluetooth-audio"),
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # APP + STATE
@@ -3340,6 +3366,11 @@ HTML_TEMPLATE = """<!doctype html>
 body{font-family:Arial,sans-serif;margin:0;padding:16px;background:#f0f2f5;color:#222}
 h1{font-size:1.6em;margin:0 0 4px}
 h3{margin:0 0 10px;font-size:1.05em}
+.help{float:right;font-size:0.78em;font-weight:normal;color:#1a6fb5;text-decoration:none}
+.help:hover{text-decoration:underline}
+.manual-links{font-size:0.88em;margin:0 0 12px}
+.manual-links a{color:#1a6fb5;text-decoration:none}
+.manual-links a:hover{text-decoration:underline}
 .card{background:#fff;border-radius:10px;border:1px solid #dde;padding:16px;margin-bottom:14px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .row label.lbl{width:150px;flex-shrink:0;font-size:0.95em}
@@ -4219,6 +4250,8 @@ window.onload=function(){
 <div id="toast"></div>
 <h1 id="pageTitle" style="margin-bottom:2px">{% if player_name %}{{ player_name }}{% else %}Stage Audio Works Video Player{% endif %}</h1>
 <div id="pageSubtitle" style="font-size:0.95em;color:#666;margin-bottom:12px">{% if player_name %}Stage Audio Works Video Player{% endif %}</div>
+<div class="manual-links">&#128214; <a href="/manual" target="_blank" rel="noopener">User manual</a>
+  &middot; <a href="/manual?online=1" target="_blank" rel="noopener" title="The latest version, on GitHub - needs internet access">latest online</a></div>
 
 <!-- ── Player name ── -->
 <div class="card" style="padding:12px 16px">
@@ -4257,7 +4290,7 @@ window.onload=function(){
 
 <!-- ── System info ── -->
 <div class="card">
-  <h3>🖥 System</h3>
+  <h3>🖥 System<a class="help" href="/manual?section=system" target="_blank" rel="noopener">? Help</a></h3>
   <div id="si_power" style="display:none;margin:0 0 10px;padding:8px 12px;border-radius:6px;font-size:0.9em"></div>
   <div class="sys-grid">
     <div class="sys-item">
@@ -4288,7 +4321,7 @@ window.onload=function(){
 
 <!-- ── Audio output ── -->
 <div class="card">
-  <h3>🔊 Audio Output</h3>
+  <h3>🔊 Audio Output<a class="help" href="/manual?section=audio" target="_blank" rel="noopener">? Help</a></h3>
   <p class="audio-hint">Plug in USB adapter then click Refresh. Selection persists across reboots.</p>
   <select id="audioSel" style="width:100%;max-width:500px;padding:5px;margin-bottom:8px"></select><br>
   <button class="btn btn-green btn-sm" onclick="applyAudioDevice()">Apply</button>
@@ -4298,7 +4331,7 @@ window.onload=function(){
 
 <!-- AES67 network audio: shown only on units with install-aes67.sh -->
 <div class="card" id="aesCard" style="display:none">
-  <h3>&#127760; AES67 Network Audio</h3>
+  <h3>&#127760; AES67 Network Audio<a class="help" href="/manual?section=aes67" target="_blank" rel="noopener">? Help</a></h3>
   <!-- Not installed: the way to install it. Installed: the same panel, for a re-run. -->
   <div id="aesInstall" style="display:none">
     <p class="audio-hint" id="aesInstIntro">AES67 sends the player's audio to the network &mdash; into a Q-SYS Core,
@@ -4336,7 +4369,7 @@ window.onload=function(){
 
 <!-- Bluetooth audio -->
 <div class="card" id="btCard">
-  <h3>&#127911; Bluetooth Audio</h3>
+  <h3>&#127911; Bluetooth Audio<a class="help" href="/manual?section=bluetooth" target="_blank" rel="noopener">? Help</a></h3>
   <div id="btHead" class="aes-head aes-off">&hellip;</div>
   <div id="btAlerts"></div>
   <div id="btMain" style="display:none">
@@ -4358,7 +4391,7 @@ window.onload=function(){
 
 <!-- Output resolution -->
 <div class="card">
-  <h3>&#128250; Output Resolution</h3>
+  <h3>&#128250; Output Resolution<a class="help" href="/manual?section=resolution" target="_blank" rel="noopener">? Help</a></h3>
   <p class="audio-hint">Forces the HDMI output mode. Only resolutions this display reports are listed.
      Content here is PAL 25 fps, so 50 Hz divides evenly into the frame rate and 60 Hz does not &mdash;
      if a clip judders on an otherwise clean file, try 50 Hz first.
@@ -4377,7 +4410,7 @@ window.onload=function(){
 
 <!-- ── Manage videos ── -->
 <div class="card">
-  <h3>📁 Manage Videos</h3>
+  <h3>📁 Manage Videos<a class="help" href="/manual?section=videos" target="_blank" rel="noopener">? Help</a></h3>
   <div id="maxUploadLabel" style="font-size:0.82em;color:#555;margin:-4px 0 10px">Calculating available space…</div>
 
   {% for slot_id, slot_label, slot_url, slot_badge in [
@@ -4428,7 +4461,7 @@ window.onload=function(){
 
 <!-- ── Software update ── -->
 <div class="card">
-  <h3>⚙️ Software Update</h3>
+  <h3>⚙️ Software Update<a class="help" href="/manual?section=update" target="_blank" rel="noopener">? Help</a></h3>
   <div style="font-size:0.9em;margin:0 0 10px">Installed version: <b id="updInstalled">&hellip;</b></div>
 
   <div style="font-weight:600;font-size:0.9em;margin:0 0 4px">Update from GitHub</div>
@@ -5084,6 +5117,40 @@ def logs_tail():
 # ══════════════════════════════════════════════════════════════════════════════
 # SYSTEM INFO + MANAGEMENT ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USER MANUAL
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The web UI's "User manual" link and the panels' Help links. The PDF on the
+# unit comes first: it works on a closed network, which is where most units
+# are. A unit without one (updated through the web UI only, which installs the
+# player script and nothing else) gets the page on GitHub. Sections come from
+# MANUAL_SECTIONS only - nothing from the request reaches a URL.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def manual_local() -> Optional[str]:
+    """The manual PDF on this unit, or None."""
+    for path in MANUAL_PDFS:
+        if os.path.isfile(path):
+            return path
+    return None
+
+@app.route("/manual")
+def manual():
+    """?section=<a MANUAL_SECTIONS key> opens it there; ?online=1 goes to GitHub."""
+    sec = MANUAL_SECTIONS.get(request.args.get("section", ""))
+    if request.args.get("online") != "1" and manual_local():
+        return redirect("/manual.pdf" + ("#nameddest=" + sec[0] if sec else ""))
+    return redirect(MANUAL_ONLINE + ("#" + sec[1] if sec else ""))
+
+@app.route("/manual.pdf")
+def manual_pdf():
+    path = manual_local()
+    if not path:
+        return redirect(MANUAL_ONLINE)
+    return send_file(path, mimetype="application/pdf", as_attachment=False,
+                     download_name="SAW_Video_Player_Manual.pdf", max_age=0)
 
 @app.route("/system/info")
 def system_info():
