@@ -168,6 +168,17 @@ static inline void ptp_parse(const char *body, ptp_info *out)
     json_string(json_value(body, "gmid"), out->gmid, sizeof out->gmid, keep_gmid);
 }
 
+/* A grandmaster id worth naming: not empty, and not all zeros - the daemon
+ * reports 00-00-00-00-00-00-00-00 while it has no grandmaster, and a change
+ * to or from that is PTP coming and going, not a new grandmaster. */
+static inline int gmid_known(const char *gmid)
+{
+    if (!gmid) return 0;
+    for (; *gmid; gmid++)
+        if (*gmid != '0' && *gmid != '-' && *gmid != ':') return 1;
+    return 0;
+}
+
 /* Splits an HTTP response held in a NUL-terminated buffer. Returns the status
  * code and points *body at the body, or returns -1 if it is not HTTP. */
 static inline int http_split(const char *buf, const char **body)

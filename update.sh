@@ -125,6 +125,22 @@ SUDOEOF
         info "NetworkManager-wait-online already disabled"
     fi
 
+    # ── Retire the userspace watchdog unit an earlier install.sh wrote ────────
+    # It waited for a device that never appears, holding the player back 90 s
+    # on every boot, and could not open the hardware watchdog systemd already
+    # pets (RuntimeWatchdogSec). install.sh explains; this does the same.
+    local wd_unit="/etc/systemd/system/watchdog.service"
+    if [[ -f "${wd_unit}" ]] && grep -q "^Before=saw-player.service" "${wd_unit}"; then
+        info "Removing the old userspace watchdog unit (it delayed every boot by 90 s)..."
+        systemctl stop    watchdog.service &>/dev/null || true
+        systemctl disable watchdog.service &>/dev/null || true
+        rm -f "${wd_unit}"
+        systemctl daemon-reload
+        systemctl disable watchdog.service &>/dev/null || true
+        systemctl stop    watchdog.service &>/dev/null || true
+        info "  ✅  removed"
+    fi
+
     # NOTE: this used to inject Environment=GPIOZERO_PIN_FACTORY=lgpio into the
     # service file. That was removed — gpiozero is not used (the player calls
     # lgpio directly), and re-adding a line that is no longer in the repo's

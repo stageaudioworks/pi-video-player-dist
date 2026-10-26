@@ -596,7 +596,7 @@ static void poll_ptp(ptp_gate *gate)
         __atomic_store_n(&g_card_may_open, now, __ATOMIC_RELAXED);
     }
     pthread_mutex_lock(&g_st_lock);
-    if (strcmp(g_st.ptp.gmid, p.gmid) != 0 && g_st.ptp.gmid[0] && p.gmid[0])
+    if (strcmp(g_st.ptp.gmid, p.gmid) != 0 && gmid_known(g_st.ptp.gmid) && gmid_known(p.gmid))
         logmsg(4, "PTP grandmaster changed: %s -> %s", g_st.ptp.gmid, p.gmid);
     g_st.ptp = p;
     pthread_mutex_unlock(&g_st_lock);

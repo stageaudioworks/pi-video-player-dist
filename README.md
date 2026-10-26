@@ -75,7 +75,7 @@ after install.
   Only modes the attached display actually reports are offered, and the player falls
   back to the display's preferred mode automatically if it cannot start on the one
   chosen — so a wrong pick cannot leave a unit with no picture.
-- **AES67 network audio** *(optional, experimental)*: on a unit where
+- **AES67 network audio** *(optional)*: on a unit where
   `install-aes67.sh` has been run, the audio can be sent to the network as an AES67
   stream — into a Q-SYS Core, for example — instead of HDMI. See below.
 - **Bluetooth audio**: turn Bluetooth on in the web UI, scan, pair a speaker or
@@ -162,11 +162,10 @@ The service runs `/home/pi/saw_player.py`. Deploying means copying the versioned
 script to that name and restarting `saw-player` — the install/update scripts pick the
 highest-numbered `RPi_Video_Player_v*.py` automatically.
 
-### AES67 network audio (optional, experimental)
+### AES67 network audio (optional)
 
-> **Experimental.** Built from a proven reference design and tested on a development
-> machine, but **not yet run against a real PTP grandmaster and receiver.** Prove it on
-> a bench before relying on it.
+Proven on the bench with a Q-SYS Core as the receiver and grandmaster-locked PTP:
+clean audio, clip changes, cable pulls, reboots and power cuts.
 
 Never installed by the one-liner. On a unit that already has the player, with internet
 access for 20–40 minutes, install it **from the web UI** — the AES67 panel checks the
@@ -184,9 +183,17 @@ It builds Merging's RAVENNA kernel module and the aes67-daemon, plus
 continuously, so receivers see one unbroken stream through every clip change, and
 corrects for the drift between the Pi's clock and the network's PTP clock. Then choose
 **AES67 network** in the web UI's Audio Output; an AES67 panel shows the stream's
-state, stereo or mono, and a lip-sync offset.
+state, stereo or mono, and a lip-sync offset. Once on air the stream stays on air —
+silent while another output is chosen — so receivers never lose it.
 
-Needs: a Pi 5 with 2 GB or more, kernel 6.12 (6.15 and later send audio in bursts), wired
+Q-SYS: the stream appears in an AES67 receiver's list up to 30 seconds after it starts.
+If a receiver ever shows the stream but plays nothing (seen after the aes67-daemon
+restarts — the panel says when it has), change the **Player Name**: that renames the
+stream, and Q-SYS picks the new name up straight away.
+
+Needs: a Pi 5 with 2 GB or more, kernel 6.12 or later (6.15 and later send audio in
+bursts that receivers with small buffers can stutter on; a Q-SYS Core played it cleanly
+on 6.18), wired
 Ethernet, and a PTP grandmaster on the network (normally the Q-SYS Core). Build one unit
 and clone its SD card for the rest — each clone takes its own multicast group at first
 boot. The kernel is held at its current version, because a kernel update removes the
@@ -215,7 +222,7 @@ cat /run/saw-aes67/bridge.json              # the bridge's view: PTP, card, drif
 
 ## Project state
 
-- `RPi_Video_Player_v12.py` — **current version.**
+- `RPi_Video_Player_v13.py` — **current version.**
 
 ## License
 

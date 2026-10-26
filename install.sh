@@ -26,7 +26,7 @@
 #   sudo bash install.sh --help       show usage
 #
 # What this script does:
-#   1. Installs dependencies (mpv, Python packages, Bluetooth audio, watchdog)
+#   1. Installs dependencies (mpv, Python packages, Bluetooth audio)
 #   2. Creates directories and installs the player script + systemd service
 #   3. Configures the Raspberry Pi hardware watchdog
 #   4. Writes the sudoers rules the web UI needs, puts in place what lets the
@@ -202,11 +202,13 @@ else
     info "  bluez already installed"
 fi
 
-for pkg in bluez-alsa-utils libasound2-plugin-bluez; do
+# rfkill: Trixie Lite images do not ship it, and without it a radio that comes
+# up blocked (a cloned image can) cannot be unblocked by the player.
+for pkg in bluez-alsa-utils libasound2-plugin-bluez rfkill; do
     if ! dpkg -s "${pkg}" &>/dev/null; then
         warn "${pkg} not found — installing..."
         apt-get install -y "${pkg}" \
-            || warn "Could not install ${pkg} — Bluetooth audio output will not work"
+            || warn "Could not install ${pkg} — Bluetooth audio output may not work"
     else
         info "  ${pkg} already installed"
     fi
@@ -256,14 +258,6 @@ SUDOEOF
         warn "  Bluetooth rfkill sudo rule failed visudo's check - not installed"
     fi
     rm -f "${BT_TMP}"
-fi
-
-# ── watchdog daemon (userspace helper — the kernel module is separate) ────────
-if ! command -v watchdog &>/dev/null; then
-    warn "watchdog daemon not found — installing..."
-    apt-get install -y watchdog || warn "Could not install watchdog daemon"
-else
-    info "watchdog daemon already installed"
 fi
 
 # =============================================================================
@@ -325,68 +319,37 @@ fi
 # =============================================================================
 header "3 / 4 — Hardware watchdog"
 # =============================================================================
-# The Pi 5 (BCM2712) exposes a hardware watchdog at /dev/watchdog. The kernel
-# module loads automatically on Bookworm. We configure the userspace daemon to
-# pet it, and also point systemd's own watchdog at the hardware device as an
-# independent second layer — if systemd itself hangs, the hardware still fires.
+# The Pi 5 (BCM2712) has a hardware watchdog. systemd itself pets it
+# (RuntimeWatchdogSec below): if the kernel or systemd hangs, the hardware
+# reboots the Pi. That is the whole watchdog. The player's own mpv watchdog
+# looks after playback.
+#
+# Up to v12 this installer also ran the userspace watchdog daemon, through a
+# unit of its own. Retired in v13, because on the bench it did harm and no
+# good:
+#   * Its unit waited for dev-watchdog.device, which never appears (systemd
+#     names the device /dev/watchdog0), and saw-player was ordered after it -
+#     every boot waited the full 90 s device timeout before the player started.
+#   * systemd already holds the hardware device, so the daemon could not open
+#     it: it ran, but pet nothing.
+# A unit written by an earlier run is taken out here.
 # =============================================================================
 
-WATCHDOG_CONF="/etc/watchdog.conf"
-
-info "Configuring watchdog daemon (${WATCHDOG_CONF})..."
-cat > "${WATCHDOG_CONF}" << 'WDEOF'
-# Stage Audio Works — watchdog configuration
-# Hardware watchdog device (BCM2712 on RPi 5)
-watchdog-device         = /dev/watchdog
-# How often the daemon pets the watchdog (seconds).
-# Must be less than watchdog-timeout below.
-interval                = 10
-# Hardware timeout — if the daemon dies and stops petting the watchdog,
-# the Pi reboots after this many seconds.
-watchdog-timeout        = 60
-# Reboot if load average (1 min) exceeds this — catches runaway processes
-max-load-1              = 24
-# Reboot if free memory falls below this many pages (~4 MB at 4 KB/page)
-min-memory              = 1
-# Log to syslog
-log-dir                 = /var/log/watchdog
-WDEOF
-
-mkdir -p /var/log/watchdog
-
-# ── Native systemd unit for the watchdog daemon ───────────────────────────────
-# The watchdog apt package on Bookworm ships only a SysV init script. When
-# systemd tries to enable it through the SysV compatibility shim it prints
-# "Job for watchdog.service canceled" and silently does nothing. The fix is to
-# write a proper native unit that bypasses the shim entirely.
 WATCHDOG_UNIT="/etc/systemd/system/watchdog.service"
-info "Writing native systemd unit → ${WATCHDOG_UNIT}"
-cat > "${WATCHDOG_UNIT}" << 'WDUNIT'
-[Unit]
-Description=Software watchdog daemon
-After=dev-watchdog.device
-Wants=dev-watchdog.device
-Before=saw-player.service
+if [[ -f "${WATCHDOG_UNIT}" ]] && grep -q "^Before=saw-player.service" "${WATCHDOG_UNIT}"; then
+    info "Removing the old userspace watchdog unit (it delayed every boot by 90 s)..."
+    systemctl stop    watchdog.service &>/dev/null || true
+    systemctl disable watchdog.service &>/dev/null || true
+    rm -f "${WATCHDOG_UNIT}"
+    systemctl daemon-reload
+    # The watchdog package's own SysV script, if the package is installed,
+    # must not take over the name now that the unit above is gone.
+    systemctl disable watchdog.service &>/dev/null || true
+    systemctl stop    watchdog.service &>/dev/null || true
+    info "  ✅  removed"
+fi
 
-[Service]
-Type=forking
-PIDFile=/run/watchdog.pid
-ExecStart=/usr/sbin/watchdog
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-WDUNIT
-
-chmod 644 "${WATCHDOG_UNIT}"
-systemctl daemon-reload
-systemctl enable watchdog.service &>/dev/null || warn "Could not enable watchdog.service"
-systemctl restart watchdog.service \
-    && info "Watchdog daemon started ✅" \
-    || warn "Watchdog failed to start — check: journalctl -u watchdog -n 20"
-
-# Tell systemd's own watchdog to use the hardware device as well
+# systemd pets the hardware watchdog
 SYSTEMD_CONF="/etc/systemd/system.conf"
 if ! grep -q "^RuntimeWatchdogSec" "${SYSTEMD_CONF}" 2>/dev/null; then
     info "Configuring systemd hardware watchdog (RuntimeWatchdogSec=30s)..."

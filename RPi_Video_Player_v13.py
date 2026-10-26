@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v12)
+Stage Audio Works Raspberry Pi Video Player  (v13)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -43,13 +43,14 @@ Features:
     SD card turns slow or starts failing. (Reading a clip does not wear the card.)
   • Software update from GitHub: checks the published release, and installs
     it only when it is newer, after verifying its checksum. Never downgrades.
-  • AES67 network audio (EXPERIMENTAL, opt-in): on a unit where
-    install-aes67.sh has been run, "AES67 network" appears as an audio output.
-    mpv then plays into a loopback that the saw-aes67-bridge service keeps
-    feeding to the network card, and the player keeps one stream on the
-    aes67-daemon - named after the Player Name, on this box's own multicast
-    group - matching its settings (stereo or mono, lip-sync offset). On every
-    other unit none of it is offered and nothing runs.
+  • AES67 network audio (opt-in): on a unit where install-aes67.sh has been
+    run, "AES67 network" appears as an audio output. mpv then plays into a
+    loopback that the saw-aes67-bridge service keeps feeding to the network
+    card, and the player keeps one stream on the aes67-daemon - named after
+    the Player Name, on this box's own multicast group - matching its settings
+    (stereo or mono, lip-sync offset). Once on air the stream stays on air,
+    silent while another output is chosen. On every other unit none of it is
+    offered and nothing runs.
   • Bluetooth audio (bluez-alsa): turn Bluetooth on, scan, pair, choose a
     speaker as the audio output, forget it, turn Bluetooth off. The chosen
     speaker reconnects after a reboot, and whenever it drops out the player
@@ -103,7 +104,7 @@ AES67 endpoints (report {"installed": false} on a unit without it):
   /aes67/status   GET  — stream, PTP and bridge state, settings, alerts
   /aes67/settings POST — channels (1 or 2) and lip-sync offset in ms
   /aes67/sdp      GET  — the stream's SDP, as the daemon publishes it
-  /aes67/dismiss  POST — acknowledge the grandmaster-changed alert
+  /aes67/dismiss  POST — acknowledge the grandmaster-changed / daemon-restarted alerts
 
 Bluetooth endpoints (the actions are queued; /bluetooth/status reports them):
   /bluetooth/status    GET  — adapter, paired devices, scan results, link state
@@ -231,6 +232,7 @@ AES67_INSTALL_DISK_MB = 5120       # build tree plus the installer's temporary s
 # ── Bluetooth audio (see the BLUETOOTH AUDIO section) ─────────────────────────
 BT_CTL               = ["bluetoothctl"]   # a list, so the tests can put a fake in its place
 BT_SCAN_S            = 15        # how long a scan listens for devices
+BT_SCAN_KEEP_S       = 300       # how long the panel lists what a scan found
 BT_PAIR_TIMEOUT_S    = 40        # pairing, including the device answering
 BT_CONNECT_TIMEOUT_S = 25        # one connection attempt
 BT_MONITOR_S         = 5         # how often a connected device's link is checked
@@ -313,7 +315,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 12
+PLAYER_VERSION = 13
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -635,7 +637,7 @@ def _aes67_card_name(alsa_name: str) -> bool:
     return bool(m) and m.group(1) in ("RAVENNA", "SAWLoop")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AES67 NETWORK AUDIO  (EXPERIMENTAL — only on units with install-aes67.sh)
+# AES67 NETWORK AUDIO  (only on units with install-aes67.sh)
 # ══════════════════════════════════════════════════════════════════════════════
 #
 #   mpv -> SAWLoop loopback -> saw-aes67-bridge -> RAVENNA card -> network
@@ -657,6 +659,13 @@ def _aes67_card_name(alsa_name: str) -> bool:
 #     import it again, so the web UI says so until somebody dismisses it.
 #   * The width comes from the setting, never from the clip: receivers drop or
 #     have to re-learn a stream that changes width.
+#   * Once on air, the stream is never switched off (v13). Switching it off
+#     sends a SAP deletion, and Q-SYS was seen on the bench to stay attached to
+#     the deleted stream for 12-23 minutes after it came back under the same
+#     name - no audio, while everything else looked fine. With another output
+#     chosen, the stream stays on air and the bridge fills it with silence.
+#   * A daemon restart cannot avoid that deletion, so the web UI says when the
+#     daemon has restarted, and what to do if a receiver has no audio.
 # Nothing here is needed for playback. If the daemon or the bridge is down the
 # video plays on; the web UI says what is wrong.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -791,19 +800,16 @@ def aes67_plan(selected: bool, ptp_locked: bool, have, want: dict):
     The body to PUT on source 0, or None for nothing to do.
 
     AES67 is the audio output: the stream must exist, be on, and match - once
-    PTP is locked, and only if it differs. Another output is chosen: an
-    existing stream that is on is switched off - receivers then hear nothing
-    rather than a stream of silence - keeping the rest of it as it is.
+    PTP is locked, and only if it differs. Another output is chosen: a stream
+    that is on stays on, and is kept matching (a new Player Name renames it),
+    carrying the bridge's silence. It is never switched off - see the rules
+    above: receivers hear silence rather than lose the stream. One that is off
+    (switched off by v12, or never on) is left off until AES67 is chosen.
     """
-    if selected:
-        if not ptp_locked:
-            return None
+    if not ptp_locked:
+        return None
+    if selected or (isinstance(have, dict) and have.get("enabled")):
         return want if aes67_source_differs(have, want) else None
-    if isinstance(have, dict) and have.get("enabled"):
-        off = dict(want)
-        off.update({k: have[k] for k in want if k in have})
-        off["enabled"] = False
-        return off
     return None
 
 def aes67_read_bridge(path: Optional[str] = None, now=None, stale_s: float = 10) -> dict:
@@ -859,6 +865,24 @@ def aes67_write_channels(path: str, channels: int) -> bool:
         raise
     return True
 
+def aes67_daemon_pid(proc_dir: str = "/proc") -> Optional[int]:
+    """The running aes67-daemon's PID, or None. A new PID is a daemon restart,
+    whoever caused it: systemd's watchdog, a crash, or somebody on the Pi."""
+    try:
+        names = os.listdir(proc_dir)
+    except Exception:
+        return None
+    for pid in names:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_dir, pid, "comm")) as f:
+                if f.read().strip() == "aes67-daemon":
+                    return int(pid)
+        except Exception:
+            continue
+    return None
+
 def aes67_gm_change(last: str, ptp: dict):
     """(grandmaster to remember, the previous one if it just changed, else
     None). Only a locked, non-zero id counts: unlocked for a moment between two
@@ -889,7 +913,11 @@ def aes67_view(snap: dict) -> dict:
     def head(level, text):
         return {"level": level, "text": text}
 
-    if not snap.get("selected"):
+    if not snap.get("selected") and isinstance(src, dict) and src.get("enabled"):
+        h = head("off", "Another audio output is chosen. The stream \"%s\" stays on air, silent, "
+                        "so receivers keep it. Choose \"AES67 network\" under Audio Output to send "
+                        "the player's audio to it." % snap.get("name"))
+    elif not snap.get("selected"):
         h = head("off", "Not in use. Choose \"AES67 network\" under Audio Output to send "
                         "the player's audio to the network.")
     elif not b or b.get("stale"):
@@ -930,6 +958,16 @@ def aes67_view(snap: dict) -> dict:
                     "it up from the SAP announcement." % (gm["from"], gm["to"], gm["at"]),
             "dismiss": "gm",
         })
+    rs = snap.get("restart_alert")
+    if rs:
+        alerts.append({
+            "text": "The AES67 daemon restarted at %s, so the stream went off the network for a "
+                    "few seconds. Q-SYS can stay attached to the old stream for up to 20 minutes "
+                    "afterwards: if a receiver shows the stream but has no audio, change the "
+                    "Player Name (it renames the stream) and choose the new name in the "
+                    "receiver." % rs["at"],
+            "dismiss": "restart",
+        })
     if b.get("clamp_alarm") and not b.get("stale"):
         alerts.append({"text": "The Pi's clock and the network's PTP clock are further apart than "
                                "the bridge can correct (500 ppm), so audio is dropped every few "
@@ -962,17 +1000,20 @@ class Aes67Manager:
     """
 
     def __init__(self, port=None, bridge_status=None, channels_file=None,
-                 conf_file=None, sysfs_net="/sys/class/net"):
+                 conf_file=None, sysfs_net="/sys/class/net", proc_dir="/proc"):
         self.port          = port          # None: read from the install when first needed
         self.bridge_status = bridge_status or AES67_BRIDGE_STATUS
         self.channels_file = channels_file or AES67_CHANNELS_FILE
         self.conf_file     = conf_file or AES67_DAEMON_CONF
         self.sysfs_net     = sysfs_net
+        self.proc_dir      = proc_dir
         self._lock         = threading.Lock()
         self._wake         = threading.Event()
         self._snap         = None
         self._last_gmid    = ""
         self._gm_alert     = None
+        self._daemon_pid   = None
+        self._restart_alert = None
         self._last_error   = ""
         self._thread       = None
 
@@ -1014,7 +1055,7 @@ class Aes67Manager:
         want = aes67_source_body(name, settings["channels"], address, True)
         plan = aes67_plan(selected, ptp["locked"], source, want) if reachable else None
         if plan is not None:
-            what = "created" if source is None else ("switched off" if not plan["enabled"] else "updated")
+            what = "created" if source is None else "updated"
             try:
                 r = requests.put(self._url("/source/%d" % AES67_SOURCE_ID), json=plan, timeout=(1, 5))
                 if r.status_code >= 300:
@@ -1031,6 +1072,13 @@ class Aes67Manager:
                               "at": time.strftime("%Y-%m-%d %H:%M:%S")}
             logger.warning("AES67: PTP grandmaster changed from %s to %s - receivers set up "
                            "from the SDP by hand must import it again", previous, ptp["gmid"])
+        pid = aes67_daemon_pid(self.proc_dir)
+        if pid is not None:
+            if self._daemon_pid is not None and pid != self._daemon_pid:
+                self._restart_alert = {"at": time.strftime("%Y-%m-%d %H:%M:%S")}
+                logger.warning("AES67: the daemon restarted (pid %d, was %d) - a receiver with no "
+                               "audio may need the stream renamed", pid, self._daemon_pid)
+            self._daemon_pid = pid
         if error != self._last_error:
             if error:
                 logger.warning("AES67: %s", error)
@@ -1041,7 +1089,7 @@ class Aes67Manager:
             "address": address, "rtp_port": aes67_rtp_port(self.conf_file),
             "bridge": aes67_read_bridge(self.bridge_status),
             "daemon_reachable": reachable, "ptp": ptp, "source": source,
-            "error": error, "gm_alert": self._gm_alert,
+            "error": error, "gm_alert": self._gm_alert, "restart_alert": self._restart_alert,
         }
         with self._lock:
             self._snap = snap
@@ -1051,18 +1099,21 @@ class Aes67Manager:
         with self._lock:
             snap = self._snap
             gm_alert = self._gm_alert
+            restart_alert = self._restart_alert
         if snap is None:
             return {"installed": True, "settings": aes67_settings(),
                     "headline": {"level": "warn", "text": "Checking the AES67 stream..."},
                     "alerts": [], "rows": []}
-        snap = dict(snap, gm_alert=gm_alert)
+        snap = dict(snap, gm_alert=gm_alert, restart_alert=restart_alert)
         out = aes67_view(snap)
         out.update({"installed": True, "settings": snap["settings"], "selected": snap["selected"]})
         return out
 
-    def dismiss_gm_alert(self):
+    def dismiss_alerts(self):
+        """The grandmaster-changed and daemon-restarted alerts, acknowledged."""
         with self._lock:
             self._gm_alert = None
+            self._restart_alert = None
 
     def fetch_sdp(self) -> Tuple[bool, str]:
         if self.port is None:
@@ -1168,7 +1219,8 @@ def aes67_install_checks(release: str, mem_total_mb: int, free_mb: int, wired, i
     elif kv and kv >= (6, 15):
         rows.append({"name": "Kernel", "level": "warn",
                      "text": "%s: 6.15 and later send AES67 audio in bursts that receivers with small "
-                             "buffers stutter on. 6.12 is the proven version." % release})
+                             "buffers can stutter on. A Q-SYS Core played it cleanly on 6.18 (bench, "
+                             "October 2026); 6.12 is proven with every receiver." % release})
     else:
         rows.append({"name": "Kernel", "level": "warn",
                      "text": "%s: not a tested version (6.12 is proven)" % (release or "unknown")})
@@ -1381,6 +1433,17 @@ _BT_PROP_RE   = re.compile(r"^(?:RSSI|TxPower|ManufacturerData|ServiceData|UUIDs
                            r"Paired|Bonded|Trusted|Blocked|Alias|Class|Icon|ServicesResolved|"
                            r"LegacyPairing|Appearance|AdvertisingFlags|AdvertisingData|Modalias|"
                            r"WakeAllowed|CablePairing|Sets|PreferredBearer):\s")
+# What a device name may not carry: control characters, and the replacement
+# character a name that is not valid UTF-8 decodes with (seen on the bench as
+# a stray "?" box after a speaker's name).
+_BT_NAME_JUNK_RE = re.compile("[\x00-\x1f\x7f-\x9f�]")
+
+def bt_clean_name(name) -> Optional[str]:
+    """A device name fit to show, or None if nothing is left of it."""
+    if not isinstance(name, str):
+        return None
+    name = re.sub(r"\s+", " ", _BT_NAME_JUNK_RE.sub("", name)).strip()[:64].strip()
+    return name or None
 
 def bt_mac(value) -> Optional[str]:
     """A MAC address, upper case, or None if it is not one."""
@@ -1430,6 +1493,7 @@ def bt_parse_devices(text) -> list:
         mac, name = m.group(1).upper(), (m.group(2) or "").strip()
         if _BT_PROP_RE.match(name):
             continue
+        name = bt_clean_name(name) or ""
         if not name or name.replace("-", ":").upper() == mac:
             name = None
         if mac not in seen or (seen[mac] is None and name):
@@ -1452,7 +1516,7 @@ def bt_parse_info(text) -> dict:
         return m.group(1) if m else None
     head = re.search(r"^Device ([0-9A-Fa-f:]{17})(.*)$", t, re.M)
     found = bool(head) and "not available" not in head.group(2)     # "Device <MAC> not available"
-    name = value("Alias") or value("Name")
+    name = bt_clean_name(value("Alias")) or bt_clean_name(value("Name"))
     if name and head and name.replace("-", ":").upper() == head.group(1).upper():
         name = None                                                  # its address, not a name
     icon = value("Icon") or ""
@@ -1654,7 +1718,9 @@ def bt_paired_devices() -> list:
 def bt_scan(seconds: int = BT_SCAN_S) -> list:
     """Look for devices. Classic Bluetooth only where bluetoothctl can filter
     (A2DP speakers are classic; low-energy gadgets are just noise here).
-    Speakers and headphones first, then named devices, unnamed ones last."""
+    A device with no name that does not look like audio is left out: nobody
+    can tell what it is, and it is almost never a speaker. Speakers and
+    headphones first, then named devices, unnamed speakers last."""
     with _BtSession() as s:
         for cmd in ("menu scan", "transport bredr", "back", "scan on"):
             s.send(cmd)
@@ -1667,7 +1733,10 @@ def bt_scan(seconds: int = BT_SCAN_S) -> list:
     devices = []
     for d in found[:40]:
         info = bt_info(d["mac"])
-        devices.append({"mac": d["mac"], "name": info["name"] or d["name"],
+        name = info["name"] or d["name"]
+        if not name and not info["audio"]:
+            continue
+        devices.append({"mac": d["mac"], "name": name,
                         "audio": info["audio"], "paired": info["paired"]})
     devices.sort(key=lambda d: (not d["audio"], d["name"] is None, (d["name"] or "").lower()))
     return devices
@@ -1771,11 +1840,12 @@ def _mpv_has_audio_track() -> Optional[bool]:
 def _bt_reattach_audio(force: bool) -> str:
     """
     After the speaker (re)connects, put mpv's sound back on it - without
-    stopping the picture where mpv allows. ao-reload first (mpv calls it
-    internal, so it is checked); then the audio track off and on, which
-    reopens the output and is documented; only then a restart of mpv.
+    stopping the picture where mpv allows: the audio track off and on, which
+    reopens the output; only if that fails, a restart of mpv. (v12 tried
+    ao-reload first. On the bench it never brought the sound back and cost
+    1.5 s every time, so v13 goes straight to the track.)
     `force`: the device dropped while mpv was using it, so mpv's output may
-    look alive and be dead - reload regardless.
+    look alive and be dead - reopen regardless.
     """
     if not _mpv_is_running():
         return "mpv not running - the watchdog starts it on this device"
@@ -1783,10 +1853,6 @@ def _bt_reattach_audio(force: bool) -> str:
         return "this clip has no audio"
     if not force and mpv_get_property("current-ao"):
         return "already playing"
-    mpv_command("ao-reload")
-    time.sleep(1.5)
-    if mpv_get_property("current-ao"):
-        return "audio output reopened"
     mpv_set_property("aid", "no")
     time.sleep(0.3)
     mpv_set_property("aid", "auto")
@@ -1823,6 +1889,8 @@ def bt_view(st: dict) -> dict:
         return head("err", "Bluetooth is blocked on this Pi (rfkill). On the Pi: sudo rfkill unblock bluetooth")
     if st.get("busy"):
         return head("warn", st.get("busy_label") or "Working...")
+    if not st.get("ready", True):
+        return head("warn", "Starting Bluetooth...")      # nothing read yet: say nothing about it
     if not st.get("bluealsa"):
         return head("err", "The Bluetooth audio service is not running, so nothing can play. "
                            "On the Pi: sudo systemctl status bluealsa")
@@ -1838,7 +1906,9 @@ def bt_view(st: dict) -> dict:
         return head("warn", "%s has not come back after %d attempts - trying once a minute (next in %d s). "
                             "Check it is switched on, in range and not connected to something else."
                     % (name, link.get("attempts", 0), link.get("next_in", 0)))
-    if link.get("attempts"):
+    if link.get("state") == "reconnecting":
+        if not link.get("attempts"):
+            return head("warn", "%s dropped out - reconnecting..." % name)
         return head("warn", "%s is not connected - reconnecting (attempt %d of %d before slowing "
                             "to once a minute)." % (name, link["attempts"], BT_RETRY_FAST_N))
     return head("warn", "Connecting to %s..." % name)
@@ -1866,6 +1936,8 @@ class BluetoothManager:
         self._busy_label = ""
         self._message    = None          # the last job's outcome, for the panel
         self._scan       = None
+        self._scan_until = 0.0           # the found list is shown until then
+        self._ready      = False         # read Bluetooth's state at least once since start
         self._paired     = []
         self._adapter    = {}
         self._adapter_checked = False
@@ -1925,13 +1997,19 @@ class BluetoothManager:
                 elif self._attempts >= BT_RETRY_FAST_N:
                     link["state"] = "slow"
                 else:
-                    link["state"] = "reconnecting" if self._attempts else "connecting"
+                    link["state"] = "reconnecting" if (self._attempts or self._dropped) else "connecting"
+            scan = None
+            if self._scan and now < self._scan_until:
+                paired_now = {d["mac"] for d in self._paired}
+                scan = dict(self._scan, devices=[dict(d, paired=d["paired"] or d["mac"] in paired_now)
+                                                 for d in self._scan["devices"]])
             st = {
                 "installed": bool(self._installed), "enabled": bt_config().get("enabled"),
+                "ready": self._ready,
                 "adapter": dict(self._adapter), "adapter_checked": self._adapter_checked,
                 "bluealsa": self._bluealsa, "pipewire": self._pipewire,
                 "busy": bool(self._busy or self._job), "busy_label": self._busy_label,
-                "message": self._message, "scan": self._scan,
+                "message": self._message, "scan": scan,
                 "paired": [dict(d, output=(d["mac"] == out_mac)) for d in self._paired],
                 "output": {"mac": out_mac, "name": names.get(out_mac, out_mac)} if out_mac else None,
                 "link": link,
@@ -2001,6 +2079,7 @@ class BluetoothManager:
             self._adapter, self._adapter_checked = adapter, True
             self._paired, self._bluealsa, self._pipewire = paired, bluealsa, pipewire
             self._next_refresh = now + BT_REFRESH_S
+            self._ready = True
 
     def _set_target(self, target, now: float):
         with self._lock:
@@ -2082,6 +2161,8 @@ class BluetoothManager:
                 bt_set_power(False)
                 self._applied = True
                 self._set_target(None, self._clock())
+                with self._lock:
+                    self._scan = None
                 ok = True
                 text = "Bluetooth is off." + (" The audio went back to %s." % bt_fallback_device() if using else "")
                 logger.info("Bluetooth turned off from the web UI")
@@ -2089,6 +2170,7 @@ class BluetoothManager:
                 found = bt_scan(BT_SCAN_S)
                 with self._lock:
                     self._scan = {"at": time.strftime("%H:%M:%S"), "devices": found}
+                    self._scan_until = self._clock() + BT_SCAN_KEEP_S
                 ok = True
                 audio = sum(1 for d in found if d["audio"])
                 text = ("Found %d device(s), %d of them speakers or headphones." % (len(found), audio)
@@ -2834,6 +2916,42 @@ def _get_cpu_temp() -> str:
     except Exception:
         return "N/A"
 
+_power_cache = {"at": 0.0, "value": None}
+
+def _get_power() -> dict:
+    """
+    Under-voltage, from the firmware: "now" (bit 0 of get_throttled) and
+    "since_boot" (bit 16). known is False where it cannot be read. An
+    undervolted Pi 5 runs fine until the GPU or the radio loads it, then
+    crashes - it looks exactly like a software fault, so the panel says so.
+    Cached for a few seconds: every open browser tab polls this.
+    """
+    now = time.monotonic()
+    if _power_cache["value"] is not None and now - _power_cache["at"] < 4:
+        return _power_cache["value"]
+    value = {"known": False, "now": False, "since_boot": False}
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True,
+                             text=True, timeout=3).stdout
+        m = re.search(r"throttled=(0x[0-9a-fA-F]+)", out or "")
+        if m:
+            bits = int(m.group(1), 16)
+            value = {"known": True, "now": bool(bits & 0x1), "since_boot": bool(bits & 0x10000)}
+    except Exception:
+        pass
+    if not value["known"]:
+        try:
+            for hw in sorted(os.listdir("/sys/class/hwmon")):
+                alarm = os.path.join("/sys/class/hwmon", hw, "in0_lcrit_alarm")
+                if os.path.exists(alarm):
+                    with open(alarm) as f:
+                        value = {"known": True, "now": f.read().strip() == "1", "since_boot": False}
+                    break
+        except Exception:
+            pass
+    _power_cache.update(at=now, value=value)
+    return value
+
 def _get_mem_info() -> dict:
     """Parse /proc/meminfo for total and available memory."""
     try:
@@ -3413,6 +3531,17 @@ async function fetchSysInfo(){
     const ram=document.getElementById('si_ram');
     ram.textContent=ramPinText(d.ram_pin);
     ram.style.color=(d.ram_pin&&(d.ram_pin.state==='limited'||d.ram_pin.state==='partial'))?'#b06d00':'#555';
+    /* Shown only when there is something to say: an undervolted Pi crashes
+       under load in a way that looks like a software fault. */
+    const pw=document.getElementById('si_power');
+    const p=d.power||{};
+    if(p.now||p.since_boot){
+      pw.textContent=(p.now?'⚡ UNDER-VOLTAGE NOW: ':'⚡ Under-voltage since the last boot: ')+
+        'the power supply cannot keep up. A Pi 5 then crashes or reboots under load, which looks like a software fault. Use the official 5 V / 5 A supply.';
+      pw.style.background=p.now?'#f8d7da':'#fff3cd';
+      pw.style.color=p.now?'#721c24':'#856404';
+      pw.style.display='';
+    }else pw.style.display='none';
   }catch(e){}
 }
 function setBar(id,pct){
@@ -4129,6 +4258,7 @@ window.onload=function(){
 <!-- ── System info ── -->
 <div class="card">
   <h3>🖥 System</h3>
+  <div id="si_power" style="display:none;margin:0 0 10px;padding:8px 12px;border-radius:6px;font-size:0.9em"></div>
   <div class="sys-grid">
     <div class="sys-item">
       <div class="val" id="si_temp">—</div>
@@ -4168,7 +4298,7 @@ window.onload=function(){
 
 <!-- AES67 network audio: shown only on units with install-aes67.sh -->
 <div class="card" id="aesCard" style="display:none">
-  <h3>&#127760; AES67 Network Audio <span style="font-size:0.65em;font-weight:normal;color:#a66b00">EXPERIMENTAL</span></h3>
+  <h3>&#127760; AES67 Network Audio</h3>
   <!-- Not installed: the way to install it. Installed: the same panel, for a re-run. -->
   <div id="aesInstall" style="display:none">
     <p class="audio-hint" id="aesInstIntro">AES67 sends the player's audio to the network &mdash; into a Q-SYS Core,
@@ -4217,8 +4347,8 @@ window.onload=function(){
       <div class="bt-sub">Paired devices</div>
       <div id="btPaired"></div>
       <div class="bt-sub">Add a device</div>
-      <p class="audio-hint">Put the speaker or headphones in pairing mode first. A scan takes 15 seconds.
-         The speaker chosen for audio reconnects by itself after a reboot, and whenever it drops out.</p>
+      <p class="audio-hint">Put the speaker or headphones in pairing mode first. A scan takes 15 seconds,
+         and what it finds stays listed for 5 minutes. The speaker chosen for audio reconnects by itself after a reboot, and whenever it drops out.</p>
       <button class="btn btn-blue btn-sm" id="btScanBtn" onclick="btAction('/bluetooth/scan',{})">Scan for devices</button>
       <div id="btFound"></div>
     </div>
@@ -4568,7 +4698,7 @@ def aes67_sdp_route():
 
 @app.route("/aes67/dismiss", methods=["POST"])
 def aes67_dismiss_route():
-    aes67_manager.dismiss_gm_alert()
+    aes67_manager.dismiss_alerts()
     return ("", 204)
 
 @app.route("/aes67/install", methods=["GET"])
@@ -4966,6 +5096,7 @@ def system_info():
             "uptime":    _get_uptime(),
             "hostname":  socket.gethostname(),
             "ram_pin":   ram_pinner.status(),
+            "power":     _get_power(),
         })
     except Exception:
         logger.exception("Error in /system/info")
@@ -5394,20 +5525,29 @@ ram_pinner = RamPinner()
 
 def mpv_watchdog(interval: float = 5):
     logger.info("mpv watchdog started (interval=%ss)", interval)
+    missing = None      # the clip logged as missing, so it is said once, not every 5 s
     while True:
         try:
             with state_lock:
                 restarting = state.restart_in_progress
             if not restarting and not _mpv_is_running():
-                logger.warning("Watchdog: mpv is down — restarting")
-                with state_lock:
-                    state.restart_in_progress = True
-                try:
-                    path, loop = _desired_video()
-                    _start_mpv(path, loop=loop)
-                finally:
+                path, loop = _desired_video()
+                if not os.path.exists(path):
+                    # mpv would exit at once, and be restarted again and again
+                    # for as long as the clip is missing. The upload makes it exist.
+                    if missing != path:
+                        logger.warning("Watchdog: %s is missing - mpv waits until it is uploaded", path)
+                        missing = path
+                else:
+                    missing = None
+                    logger.warning("Watchdog: mpv is down — restarting")
                     with state_lock:
-                        state.restart_in_progress = False
+                        state.restart_in_progress = True
+                    try:
+                        _start_mpv(path, loop=loop)
+                    finally:
+                        with state_lock:
+                            state.restart_in_progress = False
             time.sleep(interval)
         except Exception:
             logger.exception("mpv watchdog error")

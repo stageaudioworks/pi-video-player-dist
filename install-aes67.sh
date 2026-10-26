@@ -23,11 +23,11 @@
 #   sudo bash install-aes67.sh --check    report what is here, change nothing
 #   sudo bash install-aes67.sh --help     every option
 #
-# EXPERIMENTAL. Built from the aes67-integration skill and adapted from
-# obs-multisite's scripts/player/merging-aes67.sh (GPL-3.0-or-later, Stage
-# Audio Works) - the canonical installer, proven on this exact Pi kernel
-# (6.12.47+rpt-rpi-2712). NOT yet run against a PTP grandmaster and a receiver
-# for this project. See docs/PROJECT_HANDOFF.md.
+# Built from the aes67-integration skill and adapted from obs-multisite's
+# scripts/player/merging-aes67.sh (GPL-3.0-or-later, Stage Audio Works) - the
+# canonical installer. Proven on the bench with this player (v12, October
+# 2026): a Pi 5 on Raspberry Pi OS Trixie (kernel 6.18), a Q-SYS Core as the
+# receiver, a PTP grandmaster on the same VLAN. See docs/PROJECT_HANDOFF.md.
 #
 # What it installs
 #   * Merging's MergingRavennaALSA kernel module (bondagit/ravenna-alsa-lkm,
@@ -123,7 +123,7 @@ have()   { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
     cat <<'USAGE'
-Opt-in AES67 audio output for the SAW video player (EXPERIMENTAL).
+Opt-in AES67 audio output for the SAW video player.
 
   sudo bash install-aes67.sh [options]
 
@@ -262,7 +262,7 @@ except FileNotFoundError:
 base = {
     "http_port": 8080, "rtsp_port": 8854,
     "http_base_dir": "/usr/local/share/aes67-daemon/dist/",
-    "log_severity": 2, "playout_delay": 0,
+    "log_severity": 3, "playout_delay": 0,
     "tic_frame_size_at_1fs": 48, "max_tic_frame_size": 1024,
     "sample_rate": 48000,
     "rtp_mcast_base": "239.1.0.1", "rtp_mcast_base_sec": "239.1.0.1",
@@ -295,6 +295,9 @@ owned = {
     "streamer_enabled": False,            # holds the only capture substream
     "auto_sinks_update": False,           # true can turn a sink into a loopback
     "playout_delay": 0,
+    # 3 = warnings and up. At 2 (info) the daemon logs every SAP and PTP
+    # event - a steady stream of journal writes to the SD card all day.
+    "log_severity": 3,
 }
 if domain != "":
     owned["ptp_domain"] = int(domain)
@@ -1103,7 +1106,7 @@ main() {
     hold_kernel
     record_state
 
-    header "Done (EXPERIMENTAL)"
+    header "Done"
     info "Next, in the player's web UI: Audio Output -> AES67 network."
     info "No audio at all is usually PTP: the daemon only follows a grandmaster"
     info "(your Q-SYS Core). Check:  curl -s http://127.0.0.1:$HTTP_PORT/api/ptp/status"
