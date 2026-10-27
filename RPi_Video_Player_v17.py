@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v16)
+Stage Audio Works Raspberry Pi Video Player  (v17)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -64,6 +64,8 @@ Features:
   • No screen connected (switched off, unplugged): the player says so once, in
     the log and the web UI, and starts the video by itself when one appears
     (v16) - instead of restarting mpv every 5 s and logging each attempt.
+  • An output mode the screen cannot do is caught and reverted (v17): a start
+    counts only once mpv shows a picture, not when its control socket appears.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -217,6 +219,9 @@ DRM_STATUS    = "/sys/class/drm/%s-%s/status" % (DRM_DEVICE, DRM_CONNECTOR)
 # one - a line every MPV_QUIET_LOG_S instead - so a fault that outlasts anyone
 # watching cannot fill the SD card (it used to write ~70,000 lines a day).
 MPV_STAYS_UP_S  = 30
+# How long a fresh mpv has to show a picture before the start counts as failed
+# (see _mpv_wait_for_picture). On the bench it takes about a second.
+MPV_PICTURE_WAIT_S = 10
 MPV_QUIET_AFTER = 3
 MPV_QUIET_LOG_S = 600
 
@@ -339,7 +344,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 16
+PLAYER_VERSION = 17
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -2496,13 +2501,26 @@ def _start_mpv(path: str, loop: bool = False, quiet: bool = False):
             state.current_video = os.path.basename(path)
         say("mpv started and IPC socket ready")
 
-        # Start a thread to drain stderr so the pipe buffer never fills
+        # Start a thread to drain stderr so the pipe buffer never fills -
+        # before the wait below, which can take seconds.
         threading.Thread(
             target=_drain_mpv_stderr,
             args=(mpv_process,),
             daemon=True,
             name="mpv-stderr",
         ).start()
+
+        # The socket only proves mpv is running. A mode the screen cannot do
+        # is not fatal to mpv: it drops the picture and plays the sound on -
+        # a black screen nothing noticed until v17 (found on the bench with
+        # 1920x1080@24). A start counts once there is a picture. Not asked
+        # with no screen at all: that is no reason to doubt the mode
+        # (constraint 21), and v16 does not start mpv then anyway.
+        if display_connected() is not False and not _mpv_wait_for_picture(mpv_process, MPV_PICTURE_WAIT_S):
+            (logger.debug if quiet else logger.warning)(
+                "mpv shows no picture after %d s - the screen may not do this output mode",
+                MPV_PICTURE_WAIT_S)
+            return False
         return True
 
     except FileNotFoundError:
@@ -2511,6 +2529,25 @@ def _start_mpv(path: str, loop: bool = False, quiet: bool = False):
     except Exception:
         logger.exception("Failed to start mpv")
         mpv_process = None
+    return False
+
+def _mpv_wait_for_picture(proc, timeout: float) -> bool:
+    """
+    True once mpv shows a picture (vo-configured), or once its clip turns out
+    to have no video track to show. False if mpv exits first, or if `timeout`
+    passes with neither - mpv then runs with no video output at all.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc is None or proc.poll() is not None:
+            return False
+        if mpv_get_property("vo-configured") is True:
+            return True
+        tracks = mpv_get_property("track-list")
+        if (isinstance(tracks, list) and tracks
+                and not any(isinstance(t, dict) and t.get("type") == "video" for t in tracks)):
+            return True
+        time.sleep(0.2)
     return False
 
 def _drain_mpv_stderr(proc: subprocess.Popen):
@@ -2590,16 +2627,23 @@ def _mpv_send(command: list, timeout: float = 2.0) -> Optional[dict]:
         sock.connect(MPV_SOCKET)
         payload = json.dumps({"command": command}) + "\n"
         sock.sendall(payload.encode())
-        response = b""
+        # mpv broadcasts events ({"event": ...}) to every client, and around
+        # the start of a file they can arrive ahead of the reply: skip them.
+        buf = b""
         while True:
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    msg = json.loads(line)
+                    if "event" not in msg:
+                        sock.close()
+                        return msg
             chunk = sock.recv(4096)
             if not chunk:
                 break
-            response += chunk
-            if b"\n" in response:
-                break
+            buf += chunk
         sock.close()
-        return json.loads(response.split(b"\n")[0])
+        return None
     except Exception:
         logger.debug("mpv IPC error for command %s", command)
         return None

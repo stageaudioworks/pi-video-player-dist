@@ -1,11 +1,11 @@
 {
-  "version": 16,
-  "file": "RPi_Video_Player_v16.py",
-  "sha256": "a8c178f4dd5ac42504eba01bd140888fc014b6dc9eabf360c18f368f9252ed67",
-  "size": 276049,
+  "version": 17,
+  "file": "RPi_Video_Player_v17.py",
+  "sha256": "35d132e7d94bf01403e8e82b8f2afe891dc7c1b37d90af383936095f6493b785",
+  "size": 278318,
   "service_sha256": "fa4e720fcc95b587f3b1c7cc51705b465741c8e5b981acb94bfab07ab152a28f",
-  "manual_sha256": "f483ca76b293336cf3ac527e4ac72aa04aeeecafdd6bc115fd05532cbcee48c1",
-  "manual_size": 205951,
-  "released": "2026-10-26T12:30:08Z",
-  "source_commit": "a5de444"
+  "manual_sha256": "ad294c348a3bd87e95ef8721b8033784b516110555ac023bf7c74f1e2adc0a5e",
+  "manual_size": 206151,
+  "released": "2026-10-27T06:10:41Z",
+  "source_commit": "9ad012a"
 }

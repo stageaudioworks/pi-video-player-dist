@@ -230,7 +230,7 @@ cat /run/saw-aes67/bridge.json              # the bridge's view: PTP, card, drif
 
 ## Project state
 
-- `RPi_Video_Player_v16.py` — **current version.**
+- `RPi_Video_Player_v17.py` — **current version.**
 
 ## License
 

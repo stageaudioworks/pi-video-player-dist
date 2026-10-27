@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v16**. Features that arrived in a recent version
+**Applies to:** software version **v17**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -277,7 +277,10 @@ refresh rate the player measured.
 > This is safe to experiment with: if the player cannot start on the mode you chose,
 > it automatically falls back to the display's preferred mode, saves that, and
 > restarts. You get a message saying the mode was rejected rather than a black
-> screen.
+> screen. **This needs v17 or later.** Earlier versions missed the most common
+> case — a mode the screen cannot do, where the player carries on playing the
+> sound with no picture — and left the screen black. On an older version, if the
+> screen goes black after Apply, set Resolution back to *Auto*.
 
 Remember the PAL note from section 3: for 25 fps content, **50 Hz** is the mode
 worth trying if anything judders.
@@ -720,9 +723,8 @@ general-purpose corporate network.
 **Refresh rates are candidates, not a verified list.** The display reports which
 resolutions it supports but not which refresh rates, so some combinations offered in
 the dropdown will not exist on a given screen. The player falls back automatically
-if it cannot start on the mode chosen. *Note: this automatic fallback has been
-implemented and reviewed but not yet deliberately exercised in the field, so treat a
-rejected mode as something to verify rather than assume.*
+if it cannot start on the mode chosen — from v17; before that, a mode the screen
+could not do left a black screen with the sound still playing (see 4.7).
 
 **Override state survives reboots.** Intentional, so a closure is not undone by a
 power cut — but it is the most common cause of "the buttons have stopped working".
@@ -1105,5 +1107,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v16.*
+*Stage Audio Works — Raspberry Pi Video Player, v17.*
 *This software is provided with no warranty and no support. See `README.md`.*
