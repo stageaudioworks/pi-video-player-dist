@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v17**. Features that arrived in a recent version
+**Applies to:** software version **v18**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -165,6 +165,11 @@ Open a browser on the same network and go to:
 ```
 http://<pi-ip-address>:5000
 ```
+
+**Light or dark.** The button at the top right of the page — **Dark** or
+**Light**, with a moon or sun — switches the web interface between a light and a dark theme (v18).
+The choice is remembered by that browser only, so each person picks their own.
+Until a choice is made, the page follows the computer's own light or dark setting.
 
 **Reading the address off the screen.** After the unit boots, its console stays on
 the display for **30 seconds** before the video starts (v15). Above the login
@@ -960,7 +965,7 @@ cat /proc/asound/RAVENNA/pcm0p/sub0/status                    # RUNNING, with hw
 | **Short gaps every few minutes** | The panel's clock alert. Check the grandmaster is stable, and NTP on the Pi. |
 | **Audio leads or lags the picture** | Lip-sync offset (13.5) |
 | **AES67 not offered in Audio Output** | The installer has not finished on this unit — run it with `--check` |
-| **"Installing from here is not set up on this unit yet"** | Run the one-line installer (section 6.1) again, then reload the page |
+| **"Installing from here needs the one-line installer"** (older versions: "not set up on this unit yet") | The unit was updated only through the web interface or with `update.sh`, which cannot install the parts the AES67 install needs. Run the one-line installer (section 6.1) once, then reload the page. |
 | **Install from the web interface "cut off before it finished"** | A power cut or reboot mid-build. Run it again; it carries on from what is already done. |
 
 ### 13.9 HTTP API
@@ -1107,5 +1112,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v17.*
+*Stage Audio Works — Raspberry Pi Video Player, v18.*
 *This software is provided with no warranty and no support. See `README.md`.*

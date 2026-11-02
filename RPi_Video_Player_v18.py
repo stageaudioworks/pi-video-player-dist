@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v17)
+Stage Audio Works Raspberry Pi Video Player  (v18)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -66,6 +66,8 @@ Features:
     (v16) - instead of restarting mpv every 5 s and logging each attempt.
   • An output mode the screen cannot do is caught and reverted (v17): a start
     counts only once mpv shows a picture, not when its control socket appears.
+  • Light and dark themes for the web UI (v18): a toggle top right, remembered
+    per browser; until one is chosen it follows the computer's own setting.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -344,7 +346,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 17
+PLAYER_VERSION = 18
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -1416,8 +1418,10 @@ def aes67_install_start() -> Tuple[bool, str, str]:
     """Start the install. (ok, message, mode). The wrapper has the final say on
     the mode, and its answer is what is reported."""
     if not os.path.exists(AES67_WEBINSTALL):
-        return False, ("Installing from here is not set up on this unit yet - run the one-line "
-                       "installer again, then reload this page."), ""
+        return False, ("Installing from here needs the one-line installer, which puts in place "
+                       "the parts the web UI cannot install for itself. A unit updated only "
+                       "through the web UI, or with update.sh, does not have them yet. Run the "
+                       "one-line installer once, then reload this page."), ""
     mode = aes67_install_mode(_mem_total_mb())
     if mode == "keep":
         ram_pinner.hold("the AES67 install")    # free the memory before the build wants it
@@ -3490,16 +3494,27 @@ HTML_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
+:root{--bg:#f0f2f5;--card:#fff;--text:#222;--muted:#555;--faint:#888;--border:#dde;
+  --subtle:#f4f5f7;--track:#e0e0e0;--link:#1a6fb5;--input:#fff;
+  --ok-bg:#d4edda;--ok-fg:#155724;--warn-bg:#fff3cd;--warn-fg:#856404;--err-bg:#f8d7da;--err-fg:#721c24}
+html[data-theme=dark]{color-scheme:dark;--bg:#121417;--card:#1c1f24;--text:#e4e6ea;--muted:#a9afb8;
+  --faint:#7f8690;--border:#343a42;--subtle:#252a31;--track:#3a4048;--link:#6cb4ff;--input:#262b33;
+  --ok-bg:#173a22;--ok-fg:#93d9a5;--warn-bg:#3b3110;--warn-fg:#ecca62;--err-bg:#41191d;--err-fg:#f3a1a8}
+html[data-theme=dark] input:not([type=range]):not([type=checkbox]):not([type=file]),
+html[data-theme=dark] select,html[data-theme=dark] textarea{background:var(--input);color:var(--text);border-color:var(--border)}
+.theme-toggle{position:absolute;top:14px;right:16px;background:var(--card);color:var(--text);
+  border:1px solid var(--border);border-radius:16px;padding:5px 12px;font-size:0.85em;cursor:pointer}
+.theme-toggle:hover{border-color:var(--muted)}
 *{box-sizing:border-box}
-body{font-family:Arial,sans-serif;margin:0;padding:16px;background:#f0f2f5;color:#222}
-h1{font-size:1.6em;margin:0 0 4px}
+body{position:relative;font-family:Arial,sans-serif;margin:0;padding:16px;background:var(--bg);color:var(--text)}
+h1{font-size:1.6em;margin:0 0 4px;padding-right:100px;overflow-wrap:anywhere}  /* room for the theme toggle */
 h3{margin:0 0 10px;font-size:1.05em}
-.help{float:right;font-size:0.78em;font-weight:normal;color:#1a6fb5;text-decoration:none}
+.help{float:right;font-size:0.78em;font-weight:normal;color:var(--link);text-decoration:none}
 .help:hover{text-decoration:underline}
 .manual-links{font-size:0.88em;margin:0 0 12px}
-.manual-links a{color:#1a6fb5;text-decoration:none}
+.manual-links a{color:var(--link);text-decoration:none}
 .manual-links a:hover{text-decoration:underline}
-.card{background:#fff;border-radius:10px;border:1px solid #dde;padding:16px;margin-bottom:14px}
+.card{background:var(--card);border-radius:10px;border:1px solid var(--border);padding:16px;margin-bottom:14px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .row label.lbl{width:150px;flex-shrink:0;font-size:0.95em}
 .row input[type=file]{flex:1;min-width:0;font-size:0.9em}
@@ -3511,27 +3526,27 @@ h3{margin:0 0 10px;font-size:1.05em}
 .btn-sm{padding:5px 12px;font-size:0.85em}
 /* status */
 .status-grid{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:0.95em}
-.status-grid b{text-align:right;color:#555}
+.status-grid b{text-align:right;color:var(--muted)}
 /* volume */
 input[type=range]{width:260px;vertical-align:middle}
 /* progress */
 .prog-wrap{display:none;margin-top:4px;width:100%}
-.prog-bg{background:#e0e0e0;border-radius:6px;height:12px;overflow:hidden}
+.prog-bg{background:var(--track);border-radius:6px;height:12px;overflow:hidden}
 .prog-fg{height:12px;width:0;background:#28a745;border-radius:6px;transition:width .15s}
-.prog-lbl{font-size:0.78em;color:#555;margin-top:2px}
+.prog-lbl{font-size:0.78em;color:var(--muted);margin-top:2px}
 /* system info */
 .sys-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.sys-item{background:#f8f9fa;border-radius:8px;padding:10px 12px}
-.sys-item .val{font-size:1.15em;font-weight:bold;color:#007bff}
-.sys-item .key{font-size:0.78em;color:#666;margin-top:2px}
-.bar-bg{background:#ddd;border-radius:4px;height:6px;margin-top:4px}
+.sys-item{background:var(--subtle);border-radius:8px;padding:10px 12px}
+.sys-item .val{font-size:1.15em;font-weight:bold;color:var(--link)}
+.sys-item .key{font-size:0.78em;color:var(--muted);margin-top:2px}
+.bar-bg{background:var(--track);border-radius:4px;height:6px;margin-top:4px}
 .bar-fg{height:6px;border-radius:4px;background:#28a745;transition:width .5s}
 .bar-fg.warn{background:#fd7e14}
 .bar-fg.danger{background:#dc3545}
 /* slot status */
 .slot-badge{font-size:0.75em;padding:2px 7px;border-radius:10px;font-weight:bold;margin-left:6px}
-.slot-ok{background:#d4edda;color:#155724}
-.slot-missing{background:#f8d7da;color:#721c24}
+.slot-ok{background:var(--ok-bg);color:var(--ok-fg)}
+.slot-missing{background:var(--err-bg);color:var(--err-fg)}
 /* toast */
 #toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(80px);
   background:#222;color:#fff;padding:12px 26px;border-radius:10px;font-size:0.95em;
@@ -3542,26 +3557,26 @@ input[type=range]{width:260px;vertical-align:middle}
 #toast.err{background:#dc3545}
 #toast.info{background:#007bff}
 /* override / audio */
-.audio-hint{font-size:0.8em;color:#555;margin:4px 0 6px}
-.audio-hint a{color:#007bff}
+.audio-hint{font-size:0.8em;color:var(--muted);margin:4px 0 6px}
+.audio-hint a{color:var(--link)}
 /* AES67 */
 .aes-head{padding:8px 10px;border-radius:6px;font-size:0.9em;margin:4px 0 8px}
-.aes-ok{background:#d4edda;color:#155724}
-.aes-warn{background:#fff3cd;color:#856404}
-.aes-err{background:#f8d7da;color:#721c24}
-.aes-off{background:#eef0f4;color:#555}
-.aes-alert{background:#fff3cd;color:#856404;border-left:4px solid #e0a800;padding:6px 10px;font-size:0.85em;margin:0 0 8px;border-radius:4px}
+.aes-ok{background:var(--ok-bg);color:var(--ok-fg)}
+.aes-warn{background:var(--warn-bg);color:var(--warn-fg)}
+.aes-err{background:var(--err-bg);color:var(--err-fg)}
+.aes-off{background:var(--subtle);color:var(--muted)}
+.aes-alert{background:var(--warn-bg);color:var(--warn-fg);border-left:4px solid #e0a800;padding:6px 10px;font-size:0.85em;margin:0 0 8px;border-radius:4px}
 .aes-grid{display:grid;grid-template-columns:max-content 1fr;gap:3px 14px;font-size:0.82em;margin:4px 0 6px}
-.aes-grid .key{color:#666}
+.aes-grid .key{color:var(--muted)}
 .aes-grid div{overflow-wrap:anywhere}
 /* Bluetooth */
 .bt-sub{font-weight:600;font-size:0.9em;margin:14px 0 4px}
-.bt-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:7px 0;border-top:1px solid #eef0f4;font-size:0.88em}
+.bt-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:7px 0;border-top:1px solid var(--subtle);font-size:0.88em}
 .bt-name{font-weight:600;overflow-wrap:anywhere}
-.bt-meta{color:#666;font-size:0.9em;flex:1;min-width:150px;overflow-wrap:anywhere}
+.bt-meta{color:var(--muted);font-size:0.9em;flex:1;min-width:150px;overflow-wrap:anywhere}
 /* misc */
-.downloads a{margin-right:10px;text-decoration:none;color:#007bff;font-size:0.9em}
-.sep{border:none;border-top:1px solid #eee;margin:12px 0}
+.downloads a{margin-right:10px;text-decoration:none;color:var(--link);font-size:0.9em}
+.sep{border:none;border-top:1px solid var(--border);margin:12px 0}
 </style>
 <script>
 /* ── Toast ── */
@@ -3581,7 +3596,7 @@ async function fetchStatus(){
     const ss=document.getElementById('ss');
     if(d.display===false&&d.state!=='playing'){
       ss.textContent='no screen connected ('+d.connector+') - the video starts when one is switched on or plugged in';
-      ss.style.color='#b06d00';
+      ss.style.color='var(--warn-fg)';
     }else{ss.textContent=d.state;ss.style.color='';}
     document.getElementById('sp').textContent=d.position;
     document.getElementById('sr').textContent=d.remaining;
@@ -3693,7 +3708,7 @@ async function fetchSysInfo(){
     document.getElementById('si_host').textContent=d.hostname;
     const ram=document.getElementById('si_ram');
     ram.textContent=ramPinText(d.ram_pin);
-    ram.style.color=(d.ram_pin&&(d.ram_pin.state==='limited'||d.ram_pin.state==='partial'))?'#b06d00':'#555';
+    ram.style.color=(d.ram_pin&&(d.ram_pin.state==='limited'||d.ram_pin.state==='partial'))?'var(--warn-fg)':'var(--muted)';
     /* Shown only when there is something to say: an undervolted Pi crashes
        under load in a way that looks like a software fault. */
     const pw=document.getElementById('si_power');
@@ -3701,8 +3716,8 @@ async function fetchSysInfo(){
     if(p.now||p.since_boot){
       pw.textContent=(p.now?'⚡ UNDER-VOLTAGE NOW: ':'⚡ Under-voltage since the last boot: ')+
         'the power supply cannot keep up. A Pi 5 then crashes or reboots under load, which looks like a software fault. Use the official 5 V / 5 A supply.';
-      pw.style.background=p.now?'#f8d7da':'#fff3cd';
-      pw.style.color=p.now?'#721c24':'#856404';
+      pw.style.background=p.now?'var(--err-bg)':'var(--warn-bg)';
+      pw.style.color=p.now?'var(--err-fg)':'var(--warn-fg)';
       pw.style.display='';
     }else pw.style.display='none';
   }catch(e){}
@@ -3818,7 +3833,7 @@ async function loadBt(){
   const st=document.getElementById('btSt');
   if(d.message&&d.message.text&&!d.busy){
     st.textContent=d.message.text+' ('+d.message.at+')';
-    st.style.color=d.message.ok?'#155724':'#721c24';
+    st.style.color=d.message.ok?'var(--ok-fg)':'var(--err-fg)';
   }
   const usable=d.installed&&(!d.adapter_checked||d.adapter.present);
   document.getElementById('btMain').style.display=usable?'':'none';
@@ -3865,8 +3880,8 @@ async function btAction(url,body){
     const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();
     st.textContent=d.message||(d.ok?'':'Not done');
-    st.style.color=d.ok?'#555':'#721c24';
-  }catch(e){st.textContent='Request failed';st.style.color='#721c24';}
+    st.style.color=d.ok?'var(--muted)':'var(--err-fg)';
+  }catch(e){st.textContent='Request failed';st.style.color='var(--err-fg)';}
   await loadBt();
   if(!btTimer)btTimer=setInterval(loadBt,3000);
 }
@@ -3878,7 +3893,7 @@ function btPair(mac,name){btAction('/bluetooth/pair',{mac:mac,name:name||''});}
 async function btUse(mac,name){
   const st=document.getElementById('btSt');
   st.textContent='Switching the audio to '+(name||mac)+String.fromCharCode(8230);
-  st.style.color='#555';
+  st.style.color='var(--muted)';
   await btAction('/bluetooth/use',{mac:mac});
   loadAudioDevices();
 }
@@ -3973,7 +3988,7 @@ const AES_WARN={
   keep:'The picture and this page normally keep running during the install, which takes 20 to 40 minutes. The build works the Pi hard, though, so the screen could still go dark, or this page stop answering, until it finishes. Do it outside opening hours.',
   dark:'This Pi has less than 3 GB of memory, so the player is stopped while AES67 builds: the screen and this page go dark for 20 to 40 minutes and come back by themselves when it finishes. Do it outside opening hours.'
 };
-function setInstSt(t,c){const s=document.getElementById('aesInstSt');s.textContent=t;s.style.color=c||'#555';}
+function setInstSt(t,c){const s=document.getElementById('aesInstSt');s.textContent=t;s.style.color=c||'var(--muted)';}
 function showAes67Install(){
   aesInstOpen=true;
   document.getElementById('aesInstall').style.display='';
@@ -3982,7 +3997,7 @@ function showAes67Install(){
 function renderAesChecks(checks){
   const g=document.getElementById('aesChecks');
   const mark={ok:String.fromCharCode(10004),warn:'!',fail:String.fromCharCode(10008)};
-  const col={ok:'#155724',warn:'#856404',fail:'#721c24'};
+  const col={ok:'var(--ok-fg)',warn:'var(--warn-fg)',fail:'var(--err-fg)'};
   g.innerHTML='';
   (checks||[]).forEach(c=>{
     const k=document.createElement('div');k.className='key';k.textContent=c.name;
@@ -3994,7 +4009,7 @@ async function refreshAes67Install(){
   let d;
   try{d=await (await fetch('/aes67/install')).json();}
   catch(e){
-    if(aesInstWasRunning)setInstSt('The player is stopped while AES67 builds. This page reconnects by itself when it is back.','#856404');
+    if(aesInstWasRunning)setInstSt('The player is stopped while AES67 builds. This page reconnects by itself when it is back.','var(--warn-fg)');
     return;
   }
   aesInstMode=d.mode;
@@ -4010,7 +4025,7 @@ async function refreshAes67Install(){
   if(d.state!=='never'&&d.log){log.textContent=d.log;log.style.display='';log.scrollTop=log.scrollHeight;}
   if(!d.available){
     btn.style.display='none';chk.style.display='none';
-    setInstSt('Installing from here is not set up on this unit yet: run the one-line installer again, then reload this page.','#856404');
+    setInstSt('Installing from here needs the one-line installer, which puts in place the parts the web UI cannot install for itself. A unit updated only through the web UI, or with update.sh, does not have them yet. Run the one-line installer once, then reload this page.','var(--warn-fg)');
     return;
   }
   if(d.state==='running'){
@@ -4018,22 +4033,22 @@ async function refreshAes67Install(){
     aesInstOpen=true;     /* keep the outcome on screen once AES67 shows as installed */
     document.getElementById('aesInstall').style.display='';
     btn.style.display='none';chk.style.display='none';
-    setInstSt('Installing'+(d.started_at?' since '+d.started_at:'')+String.fromCharCode(8230)+' This takes 20 to 40 minutes.','#155724');
+    setInstSt('Installing'+(d.started_at?' since '+d.started_at:'')+String.fromCharCode(8230)+' This takes 20 to 40 minutes.','var(--ok-fg)');
     if(!aesInstTimer)aesInstTimer=setInterval(refreshAes67Install,5000);
     return;
   }
   if(aesInstTimer){clearInterval(aesInstTimer);aesInstTimer=null;}
   chk.style.display='';
   if(d.state==='done'){
-    setInstSt('Installed'+(d.started_at?' (started '+d.started_at+')':'')+'. A reboot is recommended to finish.','#155724');
+    setInstSt('Installed'+(d.started_at?' (started '+d.started_at+')':'')+'. A reboot is recommended to finish.','var(--ok-fg)');
     rb.style.display='';
     if(aesInstWasRunning){aesInstWasRunning=false;toast('AES67 installed','ok');loadAes67();loadAudioDevices();}
   }else if(d.state==='failed'){
     aesInstWasRunning=false;
-    setInstSt('The last install failed'+(d.exit_code!==null?' (exit '+d.exit_code+')':'')+'. The end of its log is below; all of it is in /var/log/saw-aes67-install.log.','#721c24');
+    setInstSt('The last install failed'+(d.exit_code!==null?' (exit '+d.exit_code+')':'')+'. The end of its log is below; all of it is in /var/log/saw-aes67-install.log.','var(--err-fg)');
   }else if(d.state==='interrupted'){
     aesInstWasRunning=false;
-    setInstSt('The last install was cut off before it finished '+String.fromCharCode(8212)+' a power cut, perhaps. Run it again.','#721c24');
+    setInstSt('The last install was cut off before it finished '+String.fromCharCode(8212)+' a power cut, perhaps. Run it again.','var(--err-fg)');
   }
 }
 async function checkAes67Install(){
@@ -4045,8 +4060,8 @@ async function checkAes67Install(){
     const btn=document.getElementById('aesInstBtn');
     btn.textContent=d.installed?'Run the AES67 installer':'Install AES67';
     btn.style.display=(blocked||d.state==='running')?'none':'';
-    setInstSt(blocked?'This unit cannot install AES67 as it is '+String.fromCharCode(8212)+' see above.':'Ready.',blocked?'#721c24':'#155724');
-  }catch(e){setInstSt('The check failed','#721c24');}
+    setInstSt(blocked?'This unit cannot install AES67 as it is '+String.fromCharCode(8212)+' see above.':'Ready.',blocked?'var(--err-fg)':'var(--ok-fg)');
+  }catch(e){setInstSt('The check failed','var(--err-fg)');}
 }
 async function startAes67Install(){
   const NL=String.fromCharCode(10);
@@ -4063,7 +4078,7 @@ async function startAes67Install(){
     const r=await fetch('/aes67/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});
     const d=await r.json();
     if(!d.ok){
-      setInstSt(d.message||'The install could not start','#721c24');
+      setInstSt(d.message||'The install could not start','var(--err-fg)');
       if(d.checks)renderAesChecks(d.checks);
       toast('AES67 install not started','err');
       return;
@@ -4075,7 +4090,7 @@ async function startAes67Install(){
     toast('AES67 install started','ok');
     refreshAes67Install();
     if(!aesInstTimer)aesInstTimer=setInterval(refreshAes67Install,5000);
-  }catch(e){setInstSt('Request failed','#721c24');}
+  }catch(e){setInstSt('Request failed','var(--err-fg)');}
 }
 async function toggleSdp(){
   const pre=document.getElementById('aesSdp');
@@ -4221,26 +4236,26 @@ async function checkUpdate(){
   const ab=document.getElementById('updApplyBtn');
   const cb=document.getElementById('updCheckBtn');
   ab.style.display='none';_updLatest=null;cb.disabled=true;
-  st.style.color='#555';st.textContent='Checking GitHub...';
+  st.style.color='var(--muted)';st.textContent='Checking GitHub...';
   try{
     const d=await(await fetch('/update/check')).json();
-    if(!d.ok){st.style.color='#b06d00';st.textContent='Could not check for updates: '+d.error;return;}
+    if(!d.ok){st.style.color='var(--warn-fg)';st.textContent='Could not check for updates: '+d.error;return;}
     if(d.update_available){
       _updLatest=d.latest_version;
       let t='Version v'+d.latest_version+' is available (this unit runs v'+d.installed_version+')';
       if(d.released)t+=', published '+d.released;
       t+='.';
       if(d.service_changed)t+=' This release also changes the service file, which the web UI cannot install: after updating, run the install one-liner over SSH to apply it.';
-      st.style.color='#155724';st.textContent=t;ab.style.display='';
+      st.style.color='var(--ok-fg)';st.textContent=t;ab.style.display='';
     }else if(d.newer_than_published){
-      st.style.color='#555';
+      st.style.color='var(--muted)';
       st.textContent='This unit runs v'+d.installed_version+', which is newer than the published release (v'+d.latest_version+'). Nothing to do.';
     }else{
       let t='Up to date: v'+d.installed_version+' is the latest published release.';
       if(d.build_matches===false)t+=' Note: the copy on this unit differs from the published build.';
-      st.style.color='#155724';st.textContent=t;
+      st.style.color='var(--ok-fg)';st.textContent=t;
     }
-  }catch(e){st.style.color='#b00020';st.textContent='Check failed: the unit did not respond.';}
+  }catch(e){st.style.color='var(--err-fg)';st.textContent='Check failed: the unit did not respond.';}
   finally{cb.disabled=false;}
 }
 async function applyUpdate(){
@@ -4251,23 +4266,23 @@ async function applyUpdate(){
   const ab=document.getElementById('updApplyBtn');
   const cb=document.getElementById('updCheckBtn');
   ab.disabled=true;cb.disabled=true;
-  st.style.color='#555';st.textContent='Downloading and verifying v'+_updLatest+'...';
+  st.style.color='var(--muted)';st.textContent='Downloading and verifying v'+_updLatest+'...';
   try{
     const r=await fetch('/update/apply',{method:'POST'});
     const d=await r.json().catch(()=>({ok:false,message:'unexpected response from the unit'}));
     if(r.status===207){
-      st.style.color='#b06d00';st.textContent='Installed, but the service did not restart: '+d.message;
+      st.style.color='var(--warn-fg)';st.textContent='Installed, but the service did not restart: '+d.message;
       return;
     }
     if(!r.ok||!d.ok){
-      st.style.color='#b00020';st.textContent='Update not applied: '+d.message;
+      st.style.color='var(--err-fg)';st.textContent='Update not applied: '+d.message;
       toast('Update not applied','err',8000);
       ab.disabled=false;cb.disabled=false;return;
     }
     st.textContent='Installed v'+_updLatest+'. Restarting - waiting for the unit to come back...';
     toast('Update installed, restarting','ok',8000);
     waitForVersion(_updLatest,st);
-  }catch(e){st.style.color='#b00020';st.textContent='Request failed.';ab.disabled=false;cb.disabled=false;}
+  }catch(e){st.style.color='var(--err-fg)';st.textContent='Request failed.';ab.disabled=false;cb.disabled=false;}
 }
 /* Reload only once the NEW version answers. The old process can still reply
    for a moment before systemd stops it, so "the page responds" is not enough. */
@@ -4285,7 +4300,7 @@ async function waitForVersion(want,st){
     }catch(e){}
     await sleep(2000);
   }
-  st.style.color='#b00020';
+  st.style.color='var(--err-fg)';
   st.textContent='v'+want+' was installed but has not reported back within 2 minutes. Check the unit over SSH. The previous version is saved as /home/pi/saw_player.py.bak.';
 }
 function doScriptUpload(){
@@ -4372,28 +4387,48 @@ async function doReboot(){
   setTimeout(()=>window.location.reload(),40000);
 }
 
+/* -- Light / dark -- the choice is kept in this browser only */
+function themeLabel(){
+  const b=document.getElementById('themeBtn');
+  if(!b)return;
+  const dark=document.documentElement.getAttribute('data-theme')==='dark';
+  b.textContent=dark?String.fromCharCode(9728)+' Light':String.fromCharCode(9790)+' Dark';
+}
+function toggleTheme(){
+  const next=document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark';
+  document.documentElement.setAttribute('data-theme',next);
+  try{localStorage.setItem('sawTheme',next);}catch(e){}
+  themeLabel();
+}
 window.onload=function(){
+  themeLabel();
   fetchStatus();fetchVolume();fetchSysInfo();
   fetchSlotStatus();loadAudioDevices();loadDisplayModes();fetchPlayerName();fetchMaxUpload();loadInstalledVersion();loadAes67();loadBt();
 }
 </script>
+<script>
+(function(){var t=null;try{t=localStorage.getItem('sawTheme');}catch(e){}
+if(t!=='dark'&&t!=='light'){t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';}
+document.documentElement.setAttribute('data-theme',t);})();
+</script>
 </head>
 <body>
+<button id="themeBtn" class="theme-toggle" onclick="toggleTheme()" title="Switch between light and dark"></button>
 <div id="toast"></div>
 <h1 id="pageTitle" style="margin-bottom:2px">{% if player_name %}{{ player_name }}{% else %}Stage Audio Works Video Player{% endif %}</h1>
-<div id="pageSubtitle" style="font-size:0.95em;color:#666;margin-bottom:12px">{% if player_name %}Stage Audio Works Video Player{% endif %}</div>
+<div id="pageSubtitle" style="font-size:0.95em;color:var(--muted);margin-bottom:12px">{% if player_name %}Stage Audio Works Video Player{% endif %}</div>
 <div class="manual-links">&#128214; <a href="/manual" target="_blank" rel="noopener">User manual</a>
   &middot; <a href="/manual?online=1" target="_blank" rel="noopener" title="The latest version, on GitHub - needs internet access">latest online</a></div>
 
 <!-- ── Player name ── -->
 <div class="card" style="padding:12px 16px">
   <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-    <label style="font-size:0.9em;color:#555;flex-shrink:0">📍 Player Name:</label>
+    <label style="font-size:0.9em;color:var(--muted);flex-shrink:0">📍 Player Name:</label>
     <input id="playerNameInput" type="text" maxlength="64"
       value="{{ player_name }}"
       placeholder="e.g. Entrance Hall, Gallery 3, Main Stage…"
       onkeydown="playerNameKeydown(event)"
-      style="flex:1;min-width:180px;padding:6px 10px;border:1px solid #ccc;
+      style="flex:1;min-width:180px;padding:6px 10px;border:1px solid var(--border);
              border-radius:6px;font-size:0.95em;max-width:400px">
     <button class="btn btn-green btn-sm" onclick="savePlayerName()">Save</button>
   </div>
@@ -4448,7 +4483,7 @@ window.onload=function(){
       <div class="key">Hostname</div>
     </div>
   </div>
-  <div id="si_ram" style="font-size:0.82em;color:#555;margin-top:10px">RAM-pinned clips: starting&hellip;</div>
+  <div id="si_ram" style="font-size:0.82em;color:var(--muted);margin-top:10px">RAM-pinned clips: starting&hellip;</div>
 </div>
 
 <!-- ── Audio output ── -->
@@ -4458,7 +4493,7 @@ window.onload=function(){
   <select id="audioSel" style="width:100%;max-width:500px;padding:5px;margin-bottom:8px"></select><br>
   <button class="btn btn-green btn-sm" onclick="applyAudioDevice()">Apply</button>
   <button class="btn btn-grey btn-sm" onclick="loadAudioDevices()" style="margin-left:6px">↺ Refresh</button>
-  <div id="audioSt" style="font-size:0.82em;margin-top:6px;color:#155724"></div>
+  <div id="audioSt" style="font-size:0.82em;margin-top:6px;color:var(--ok-fg)"></div>
 </div>
 
 <!-- AES67 network audio: shown only on units with install-aes67.sh -->
@@ -4481,12 +4516,12 @@ window.onload=function(){
   <div id="aesAlerts"></div>
   <div id="aesGrid" class="aes-grid"></div>
   <hr class="sep">
-  <label for="aesCh" style="font-size:0.82em;color:#555">Channels</label><br>
+  <label for="aesCh" style="font-size:0.82em;color:var(--muted)">Channels</label><br>
   <select id="aesCh" style="width:100%;max-width:340px;padding:5px;margin-bottom:8px">
     <option value="2">Stereo &mdash; channels 1 and 2</option>
     <option value="1">Mono &mdash; left and right mixed to channel 1</option>
   </select><br>
-  <label for="aesOff" style="font-size:0.82em;color:#555">Lip-sync offset (ms)</label><br>
+  <label for="aesOff" style="font-size:0.82em;color:var(--muted)">Lip-sync offset (ms)</label><br>
   <input type="number" id="aesOff" min="-1000" max="1000" step="1" style="width:110px;padding:5px;margin-bottom:4px">
   <p class="audio-hint">The player already holds the picture back for the bridge's own delay (about 90 ms).
      Use the offset for the rest of the chain: positive plays the audio later, negative earlier.
@@ -4494,8 +4529,8 @@ window.onload=function(){
   <button class="btn btn-green btn-sm" onclick="saveAes67()">Save</button>
   <button class="btn btn-grey btn-sm" onclick="toggleSdp()" style="margin-left:6px">Show SDP</button>
   <button class="btn btn-grey btn-sm" onclick="showAes67Install()" style="margin-left:6px">Update AES67 software&hellip;</button>
-  <div id="aesSt" style="font-size:0.82em;margin-top:6px;color:#155724"></div>
-  <pre id="aesSdp" style="display:none;background:#f4f5f7;padding:8px;border-radius:6px;font-size:0.75em;white-space:pre-wrap;word-break:break-all;margin:8px 0 0"></pre>
+  <div id="aesSt" style="font-size:0.82em;margin-top:6px;color:var(--ok-fg)"></div>
+  <pre id="aesSdp" style="display:none;background:var(--subtle);padding:8px;border-radius:6px;font-size:0.75em;white-space:pre-wrap;word-break:break-all;margin:8px 0 0"></pre>
   </div>
 </div>
 
@@ -4531,19 +4566,19 @@ window.onload=function(){
      will not start the player falls back to the display's preferred mode on its own.
      Applying restarts the player, so the picture goes black for a second.
      Selection persists across reboots.</p>
-  <label for="resSel" style="font-size:0.82em;color:#555">Resolution</label><br>
+  <label for="resSel" style="font-size:0.82em;color:var(--muted)">Resolution</label><br>
   <select id="resSel" onchange="syncHzEnabled()" style="width:100%;max-width:340px;padding:5px;margin-bottom:8px"></select><br>
-  <label for="resHz" style="font-size:0.82em;color:#555">Refresh rate</label><br>
+  <label for="resHz" style="font-size:0.82em;color:var(--muted)">Refresh rate</label><br>
   <select id="resHz" style="width:100%;max-width:340px;padding:5px;margin-bottom:8px"></select><br>
   <button class="btn btn-green btn-sm" onclick="applyResolution()">Apply</button>
   <button class="btn btn-grey btn-sm" onclick="loadDisplayModes()" style="margin-left:6px">&#8634; Refresh</button>
-  <div id="resSt" style="font-size:0.82em;margin-top:6px;color:#155724"></div>
+  <div id="resSt" style="font-size:0.82em;margin-top:6px;color:var(--ok-fg)"></div>
 </div>
 
 <!-- ── Manage videos ── -->
 <div class="card">
   <h3>📁 Manage Videos<a class="help" href="/manual?section=videos" target="_blank" rel="noopener">? Help</a></h3>
-  <div id="maxUploadLabel" style="font-size:0.82em;color:#555;margin:-4px 0 10px">Calculating available space…</div>
+  <div id="maxUploadLabel" style="font-size:0.82em;color:var(--muted);margin:-4px 0 10px">Calculating available space…</div>
 
   {% for slot_id, slot_label, slot_url, slot_badge in [
     ('f_loop','Loop Video',    '/upload/loop',       'sl_loop'),
@@ -4597,7 +4632,7 @@ window.onload=function(){
   <div style="font-size:0.9em;margin:0 0 10px">Installed version: <b id="updInstalled">&hellip;</b></div>
 
   <div style="font-weight:600;font-size:0.9em;margin:0 0 4px">Update from GitHub</div>
-  <p style="font-size:0.85em;color:#555;margin:0 0 8px">
+  <p style="font-size:0.85em;color:var(--muted);margin:0 0 8px">
     Checks the published release. If it is newer than this unit, it is downloaded, its checksum
     verified, validated and installed, with the current version kept as a backup, and the
     user manual on this unit is brought up to date with it. The service restarts (about 10s
@@ -4605,12 +4640,12 @@ window.onload=function(){
   </p>
   <button class="btn btn-blue btn-sm" id="updCheckBtn" onclick="checkUpdate()">Check for updates</button>
   <button class="btn btn-orange btn-sm" id="updApplyBtn" onclick="applyUpdate()" style="margin-left:6px;display:none">Update now</button>
-  <div id="updSt" style="font-size:0.85em;margin-top:6px;color:#555"></div>
+  <div id="updSt" style="font-size:0.85em;margin-top:6px;color:var(--muted)"></div>
 
   <hr class="sep">
 
   <div style="font-weight:600;font-size:0.9em;margin:0 0 4px">Upload a script manually</div>
-  <p style="font-size:0.85em;color:#555;margin:0 0 10px">
+  <p style="font-size:0.85em;color:var(--muted);margin:0 0 10px">
     Upload a new <code>.py</code> player script. The file will be validated before deployment —
     it must contain the <code>SAW_PLAYER_SIGNATURE</code> identifier and pass a Python syntax check.
     The current script is backed up automatically before replacement.
@@ -4620,13 +4655,13 @@ window.onload=function(){
     <input type="file" id="scriptFile" accept=".py" style="flex:1">
     <button class="btn btn-orange btn-sm" id="scriptBtn" onclick="doScriptUpload()">Deploy Script</button>
   </div>
-  <div id="scriptSt" style="font-size:0.85em;margin-top:6px;color:#555"></div>
+  <div id="scriptSt" style="font-size:0.85em;margin-top:6px;color:var(--muted)"></div>
 </div>
 
 <!-- ── Logs ── -->
 <div class="card">
   <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
-    <h3 style="margin:0">📋 Logs — <span id="logSize" style="font-size:0.85em;font-weight:normal;color:#555">—</span></h3>
+    <h3 style="margin:0">📋 Logs — <span id="logSize" style="font-size:0.85em;font-weight:normal;color:var(--muted)">—</span></h3>
     <button id="logToggleBtn" class="btn btn-grey btn-sm" onclick="toggleLogPanel()">▼ Show Logs</button>
   </div>
   <!-- collapsed by default — logBody is hidden until user clicks Show Logs -->
@@ -4661,7 +4696,7 @@ window.onload=function(){
 </div>
 
 <!-- ── Branding ── -->
-<div style="text-align:center;color:#888;font-size:0.85em;margin-top:8px;padding-top:12px;border-top:1px solid #dde">
+<div style="text-align:center;color:var(--faint);font-size:0.85em;margin-top:8px;padding-top:12px;border-top:1px solid var(--border)">
   A Stage Audio Works Innovation
   {% if branding_image %}<br>
     <a href="https://stageaudioworks.com" target="_blank" rel="noopener noreferrer">

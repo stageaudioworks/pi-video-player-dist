@@ -236,6 +236,13 @@ build_jobs() {   # build_jobs [MEMINFO_PATH]
 # The kernel's major.minor as one number: 6.12 -> 612. The module build goes
 # down the clang path for >= 6.10 (upstream's build.sh compares 612 >= 72, so in
 # practice every modern kernel), and >= 6.15 sends RTP in bursts.
+# The compiler the running kernel was built with - "gcc" or "clang" - from its
+# own headers; "gcc" when they do not say (every Raspberry Pi kernel is gcc).
+kernel_compiler() {   # kernel_compiler [COMPILE_H]
+    local f="${1:-/lib/modules/$(uname -r)/build/include/generated/compile.h}"
+    if grep -q 'LINUX_COMPILER.*clang' "$f" 2>/dev/null; then echo clang; else echo gcc; fi
+}
+
 kernel_num() {   # kernel_num RELEASE
     local maj min
     maj="$(echo "$1" | cut -d. -f1)"; min="$(echo "$1" | cut -d. -f2)"
@@ -697,17 +704,28 @@ build_module() {
     local dir="$BUILD_DIR/3rdparty/ravenna-alsa-lkm/driver"
     ( cd "$dir" || exit 1
       make clean >/dev/null 2>&1
-      if [ "$(kernel_num "$(uname -r)")" -ge 610 ]; then
-          # Upstream's build.sh takes every kernel >= 6.10 down the clang path.
-          info "kernel $(uname -r): building with clang"
+      # gcc 14 (Trixie) with a 6.12 kernel: the headers' strscpy() expands to
+      # BUILD_BUG_ON_ZERO, which the driver never includes - gcc 14 makes that
+      # an error (gcc 12 only warned, and 6.15+ headers include it). Seen on a
+      # field unit, 2026-11-02. Including it first is harmless everywhere else.
+      export KCFLAGS="${KCFLAGS:-} -include linux/build_bug.h"
+      # Build with the compiler the kernel was built with. Upstream's build.sh
+      # sends every kernel >= 6.10 down a clang path; Raspberry Pi kernels are
+      # built with gcc, so clang stops at once on gcc-only flags in the
+      # headers (-fmin-function-alignment, -fconserve-stack) - and that
+      # misleading error used to head the log.
+      if [ "$(kernel_compiler)" = clang ]; then
+          info "kernel $(uname -r) was built with clang: building with clang"
           make CC=clang || { warn "clang build failed - trying gcc"; make clean >/dev/null 2>&1; make; }
       else
+          info "kernel $(uname -r) was built with gcc: building with gcc"
           make
       fi
-    ) || die "the module did not build. If you see '-fmin-function-alignment=8', the
-  headers were built by a newer gcc than this one - compare
+    ) || die "the module did not build - the first 'error:' line above says why.
+  '-fmin-function-alignment' or 'unknown argument' means the kernel headers were
+  built by a newer or different compiler than this one: compare
   /lib/modules/$(uname -r)/build/include/generated/compile.h with 'gcc --version'.
-  It looks like a driver bug; it is not."
+  It looks like a driver bug; it usually is not."
     [ -f "$dir/MergingRavennaALSA.ko" ] || die "build finished but produced no MergingRavennaALSA.ko"
     local dest
     dest="/lib/modules/$(uname -r)/extra"
