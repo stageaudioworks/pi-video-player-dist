@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v18**. Features that arrived in a recent version
+**Applies to:** software version **v19**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -282,7 +282,9 @@ refresh rate the player measured.
 > This is safe to experiment with: if the player cannot start on the mode you chose,
 > it automatically falls back to the display's preferred mode, saves that, and
 > restarts. You get a message saying the mode was rejected rather than a black
-> screen. **This needs v17 or later.** Earlier versions missed the most common
+> screen. From v19 it keeps your mode if *Auto* shows no picture either — then
+> the mode was not the problem, and the screen or its cable needs looking at.
+> **This needs v17 or later.** Earlier versions missed the most common
 > case — a mode the screen cannot do, where the player carries on playing the
 > sound with no picture — and left the screen black. On an older version, if the
 > screen goes black after Apply, set Resolution back to *Auto*.
@@ -684,7 +686,7 @@ behaviour.
 sudo systemctl status saw-player              # is the service running?
 pgrep -a mpv                                  # is the player process alive?
 ls -la /tmp/saw_mpv.sock                      # is its control socket present?
-cat /sys/class/drm/card1-HDMI-A-1/status      # is the display connected?
+cat /sys/class/drm/card*-HDMI-A-1/status      # is the display connected? (card0 or card1)
 ls -la /home/pi/videos/                       # do the videos exist?
 df -h                                         # is the disk full?
 vcgencmd measure_temp                         # CPU temperature
@@ -696,7 +698,7 @@ ip -s link show eth0                          # network error counters
 
 | Symptom | Check in this order |
 |---|---|
-| **No picture at all** | The web interface's status says **no screen connected** → switch the screen on, check the cable is in HDMI port 0 (`cat /sys/class/drm/card1-HDMI-A-1/status` should say `connected`) → power supply (`dmesg \| grep -i volt`) → is the service running → does `loop.mp4` exist (without it the player waits for an upload, and says so in the log) → is mpv running |
+| **No picture at all** | The web interface's status says **no screen connected** → switch the screen on, check the cable is in HDMI port 0 (`cat /sys/class/drm/card*-HDMI-A-1/status` should say `connected`) → power supply (`dmesg \| grep -i volt`) → is the service running → does `loop.mp4` exist (without it the player waits for an upload, and says so in the log) → is mpv running |
 | **Buttons do nothing** | Override mode is on (by far the most common) → trigger file missing → a clip is already playing → wiring between GPIO pin and ground |
 | **Web page loads but every field shows a dash** | A JavaScript error is stopping the page. Open the browser console. Usually follows a bad script deployment — roll back with the `.bak` file. |
 | **No audio** | Audio device selection → volume slider not at zero → the physical output the display or amplifier is actually using → `aplay -l` shows the device |
@@ -1112,5 +1114,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v18.*
+*Stage Audio Works — Raspberry Pi Video Player, v19.*
 *This software is provided with no warranty and no support. See `README.md`.*

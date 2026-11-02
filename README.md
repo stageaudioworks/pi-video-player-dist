@@ -109,8 +109,8 @@ echo -n "TRIGGER_1" | nc -u <pi-ip> 5505
 ## Target environment
 
 Raspberry Pi 5, Raspberry Pi OS Bookworm 64-bit, user `pi`. Video is played by **mpv**
-over DRM/KMS (device `/dev/dri/card1`, connector `HDMI-A-1`, HDMI port nearest the
-USB-C socket). GPIO uses **lgpio** directly. Content is PAL region — **25 fps**.
+over DRM/KMS (connector `HDMI-A-1`, the HDMI port nearest the USB-C socket, on
+`/dev/dri/card1` - or card0 on some boots, so the player looks it up at each start). GPIO uses **lgpio** directly. Content is PAL region — **25 fps**.
 
 > The Pi 5 needs a **5 V / 5 A** supply. An underpowered unit boots and idles fine,
 > then crashes the moment the GPU loads — it looks exactly like a software fault.
@@ -221,7 +221,7 @@ sudo systemctl status saw-player
 journalctl -u saw-player -f
 grep -m1 'Video Player  (v' /home/pi/saw_player.py   # which version is deployed?
 pgrep -a mpv
-cat /sys/class/drm/card1-HDMI-A-1/status    # is the display connected?
+cat /sys/class/drm/card*-HDMI-A-1/status    # is the display connected? (card0 or card1)
 
 # AES67, on units that have it
 sudo bash /home/pi/pi-video-player/install-aes67.sh --check
@@ -230,7 +230,7 @@ cat /run/saw-aes67/bridge.json              # the bridge's view: PTP, card, drif
 
 ## Project state
 
-- `RPi_Video_Player_v18.py` — **current version.**
+- `RPi_Video_Player_v19.py` — **current version.**
 
 ## License
 

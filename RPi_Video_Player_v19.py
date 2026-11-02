@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v18)
+Stage Audio Works Raspberry Pi Video Player  (v19)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -68,6 +68,9 @@ Features:
     counts only once mpv shows a picture, not when its control socket appears.
   • Light and dark themes for the web UI (v18): a toggle top right, remembered
     per browser; until one is chosen it follows the computer's own setting.
+  • The display card is found, not assumed (v19): the HDMI controller can come
+    up as card0 or card1 depending on the boot. And a forced mode is only
+    given up if "preferred" then shows a picture.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -208,12 +211,17 @@ LOOP_VIDEO             = os.path.join(VIDEO_DIR, "loop.mp4")
 OVERRIDE_VIDEO_DEFAULT = os.path.join(VIDEO_DIR, "override.mp4")
 
 # ── Display ───────────────────────────────────────────────────────────────────
-# RPi 5: card1-HDMI-A-1 is HDMI port 0 (closest to USB-C power).
-#        card1-HDMI-A-2 is HDMI port 1.
-# Confirmed by:  cat /sys/class/drm/card1-HDMI-A-1/status
+# RPi 5: HDMI-A-1 is HDMI port 0 (closest to USB-C power), HDMI-A-2 is port 1,
+# both on the display controller (vc4) - usually card1, as in
+#   cat /sys/class/drm/card1-HDMI-A-1/status
+# But vc4 and the 3D engine (v3d) register at boot in whichever order they
+# finish probing: a field unit came up with vc4 as card0 (2026-11-02), mpv was
+# pointed at v3d, and the screen stayed black with the sound playing. So the
+# card is looked up - drm_card() - and DRM_DEVICE is only the fallback.
 DRM_DEVICE    = "card1"
 DRM_CONNECTOR = "HDMI-A-1"
-DRM_STATUS    = "/sys/class/drm/%s-%s/status" % (DRM_DEVICE, DRM_CONNECTOR)
+DRM_SYSFS     = "/sys/class/drm"
+DRM_STATUS    = None          # None: the status file of drm_card() (tests point it elsewhere)
 
 # ── mpv watchdog logging (see mpv_watchdog) ───────────────────────────────────
 # A restart that does not stay up MPV_STAYS_UP_S is a quick failure. From the
@@ -289,7 +297,7 @@ RESOLUTION_DEFAULT = "preferred"
 # Modes the attached display advertises, straight from the kernel.
 # NOTE: sysfs uses the LONG connector name (card1-HDMI-A-1) while mpv wants the
 # SHORT one (HDMI-A-1).  Mixing these up is a documented trap on this project.
-DRM_MODES_SYSFS = f"/sys/class/drm/{DRM_DEVICE}-{DRM_CONNECTOR}/modes"
+DRM_MODES_SYSFS = None        # None: the modes file of drm_card()
 
 # Validates anything we are about to hand to --drm-mode.  Also rejects
 # interlaced entries such as "1920x1080i" that appear in sysfs but are not a
@@ -346,7 +354,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 18
+PLAYER_VERSION = 19
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -2332,8 +2340,9 @@ def list_drm_modes() -> list:
     into the HDMI port.  Treat that as "unknown", not "no modes available".
     """
     modes = []
+    modes_file = DRM_MODES_SYSFS or "%s/%s-%s/modes" % (DRM_SYSFS, drm_card(), DRM_CONNECTOR)
     try:
-        with open(DRM_MODES_SYSFS) as f:
+        with open(modes_file) as f:
             for line in f:
                 mode = line.strip()
                 if not mode or mode in modes:
@@ -2344,7 +2353,7 @@ def list_drm_modes() -> list:
                     logger.debug("Skipping unusable display mode: %s", mode)
     except FileNotFoundError:
         logger.warning("Could not read %s - is anything connected to HDMI?",
-                       DRM_MODES_SYSFS)
+                       modes_file)
     except Exception:
         logger.exception("Error reading DRM modes")
     return modes
@@ -2380,7 +2389,7 @@ def _build_mpv_cmd(path: str, loop: bool = False) -> list:
     cmd = [
         "mpv",
         f"--vo=drm",
-        f"--drm-device=/dev/dri/{DRM_DEVICE}",
+        f"--drm-device=/dev/dri/{drm_card()}",
         f"--drm-connector={DRM_CONNECTOR}",
         f"--drm-mode={resolution}",   # "preferred", or a forced mode e.g. 1920x1080@50
         "--hwdec=auto-safe",          # use hardware decode where available
@@ -2603,6 +2612,11 @@ def _apply_resolution(mode: str) -> Tuple[bool, str]:
             save_resolution(RESOLUTION_DEFAULT)
             ok = _start_mpv(path, loop=loop)
             reverted = True
+            if not ok:
+                # No picture in "preferred" either: the mode was not the
+                # problem, so it is not thrown away (constraint 12).
+                _keep_mode(mode)
+                reverted = False
     except Exception:
         logger.exception("Error applying resolution")
     finally:
@@ -2612,6 +2626,16 @@ def _apply_resolution(mode: str) -> Tuple[bool, str]:
     with state_lock:
         active = state.resolution
     return (ok and not reverted, active)
+
+def _keep_mode(mode: str):
+    """After a revert that did not help: put the chosen mode back, saved.
+    With no picture in "preferred" either, the fault is elsewhere - the
+    screen, its cable, the wrong card - and the site's mode stays."""
+    logger.error("No picture in %s either - the output mode is not the problem; keeping %r. "
+                 "Check the screen and its cable.", RESOLUTION_DEFAULT, mode)
+    with state_lock:
+        state.resolution = mode
+    save_resolution(mode)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MPV IPC — JSON SOCKET COMMANDS
@@ -4045,7 +4069,7 @@ async function refreshAes67Install(){
     if(aesInstWasRunning){aesInstWasRunning=false;toast('AES67 installed','ok');loadAes67();loadAudioDevices();}
   }else if(d.state==='failed'){
     aesInstWasRunning=false;
-    setInstSt('The last install failed'+(d.exit_code!==null?' (exit '+d.exit_code+')':'')+'. The end of its log is below; all of it is in /var/log/saw-aes67-install.log.','var(--err-fg)');
+    setInstSt('The last install failed'+(d.exit_code!==null?' (exit '+d.exit_code+')':'')+'. The end of its log is below; all of it is in /var/log/saw-aes67-install.log. If this unit was updated through the web UI, its AES67 installer may be out of date: run the one-line installer, then try again.','var(--err-fg)');
   }else if(d.state==='interrupted'){
     aesInstWasRunning=false;
     setInstSt('The last install was cut off before it finished '+String.fromCharCode(8212)+' a power cut, perhaps. Run it again.','var(--err-fg)');
@@ -4169,6 +4193,9 @@ async function applyResolution(){
     if(d.reverted){
       st.textContent='Rejected: '+want+' would not start '+String.fromCharCode(8212)+' reverted to '+d.resolution+hz;
       toast(want+' not supported by this display '+String.fromCharCode(8212)+' reverted','err');
+    }else if(d.picture===false){
+      st.textContent='Set to '+d.resolution+', but there is no picture in this mode or in Auto '+String.fromCharCode(8212)+' check the screen and its cable. The mode was kept.';
+      toast('No picture '+String.fromCharCode(8212)+' check the screen','err');
     }else{
       st.textContent='Active: '+d.resolution+hz;
       toast('Output resolution set to '+d.resolution,'ok');
@@ -5069,7 +5096,8 @@ def resolution_route():
         return jsonify({
             "resolution":  active,
             "requested":   mode,
-            "reverted":    (not ok),
+            "reverted":    active != mode,
+            "picture":     ok or active != mode,   # False: no picture in any mode tried
             "display_fps": mpv_get_property("display-fps"),
         })
     except Exception:
@@ -5760,6 +5788,30 @@ ram_pinner = RamPinner()
 # WATCHDOGS
 # ══════════════════════════════════════════════════════════════════════════════
 
+_drm_card_said = None         # the card last logged, so a change is said once
+
+def drm_card(sysfs: Optional[str] = None) -> str:
+    """
+    The DRM card that owns DRM_CONNECTOR - the display controller - e.g.
+    "card1". Read from sysfs each time it is asked: the number is settled at
+    boot and can differ from one boot to the next (see DRM_DEVICE). DRM_DEVICE
+    when it cannot be told - no sysfs, or not exactly one card with that
+    connector - which leaves mpv's command line exactly as it always was.
+    """
+    global _drm_card_said
+    try:
+        cards = sorted(n[:-len(DRM_CONNECTOR) - 1] for n in os.listdir(sysfs or DRM_SYSFS)
+                       if n.startswith("card") and n.endswith("-" + DRM_CONNECTOR))
+    except Exception:
+        cards = []
+    card = cards[0] if len(cards) == 1 and re.fullmatch(r"card\d+", cards[0]) else DRM_DEVICE
+    if card != _drm_card_said:
+        if card != DRM_DEVICE:
+            logger.warning("Display: %s is on %s on this boot (usually %s) - using %s",
+                           DRM_CONNECTOR, card, DRM_DEVICE, card)
+        _drm_card_said = card
+    return card
+
 def display_connected(path: Optional[str] = None) -> Optional[bool]:
     """
     Whether a screen is on the player's HDMI connector, from the kernel's own
@@ -5769,7 +5821,7 @@ def display_connected(path: Optional[str] = None) -> Optional[bool]:
     that tells the Pi they are there.
     """
     try:
-        with open(path or DRM_STATUS) as f:
+        with open(path or DRM_STATUS or "%s/%s-%s/status" % (DRM_SYSFS, drm_card(), DRM_CONNECTOR)) as f:
             st = f.read().strip()
     except Exception:
         return None
@@ -5908,7 +5960,8 @@ def _initial_start(boot_resolution: str):
                 with state_lock:
                     state.resolution = RESOLUTION_DEFAULT
                 save_resolution(RESOLUTION_DEFAULT)
-                _start_mpv(path, loop=loop)
+                if not _start_mpv(path, loop=loop):
+                    _keep_mode(boot_resolution)
         else:
             logger.warning("Initial video not found: %s — waiting for upload", path)
     except Exception:
