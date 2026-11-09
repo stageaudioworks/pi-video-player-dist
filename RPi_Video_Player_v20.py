@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v19)
+Stage Audio Works Raspberry Pi Video Player  (v20)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -71,6 +71,9 @@ Features:
   • The display card is found, not assumed (v19): the HDMI controller can come
     up as card0 or card1 depending on the boot. And a forced mode is only
     given up if "preferred" then shows a picture.
+  • A preview of the video in the web UI (v20): a frame every 10 s while the
+    Preview panel is open, grabbed from mpv into RAM - never the SD card.
+    Every panel can be folded away; each browser remembers which.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -110,6 +113,11 @@ Display endpoints:
   /resolution    GET  — current output mode + refresh rate mpv reports
   /resolution    POST — force a mode, persist, hot-restart mpv; reverts to
                         "preferred" automatically if mpv will not start on it
+
+Preview endpoint:
+  /preview.jpg    GET  — a frame of what is playing (RAM only; at most one grab
+                         every PREVIEW_MIN_S). X-Taken: when; X-Picture: whether
+                         mpv has a video output. 503 with a reason otherwise.
 
 User manual endpoints:
   /manual         GET  — the manual: the PDF on this unit, else GitHub's page.
@@ -354,7 +362,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 19
+PLAYER_VERSION = 20
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -395,6 +403,16 @@ UPDATE_BASE_OVERRIDE = os.environ.get("SAW_UPDATE_BASE", "").strip()
 BOOT_CONSOLE_HOLD_S = 30
 BOOT_FRESH_S        = 120     # the system is this young: it has just booted
 
+# ── Preview (see PREVIEW) ─────────────────────────────────────────────────────
+# A frame of what mpv is playing, for the web UI. Written to RAM only: /dev/shm
+# is tmpfs on Raspberry Pi OS, and preview_dir_in_ram() checks it is before
+# every grab - never the SD card (/tmp is on the card on Bookworm, and
+# /run/user/1000 exists only while somebody is logged in).
+PREVIEW_DIR       = "/dev/shm"
+PREVIEW_FILE      = PREVIEW_DIR + "/saw_preview.jpg"
+PREVIEW_MIN_S     = 5          # at most one grab this often, however many browsers ask
+PREVIEW_QUALITY   = 70         # JPEG quality: ~half the bytes of mpv's 90, same look at preview size
+
 # ── User manual (see USER MANUAL) ─────────────────────────────────────────────
 # The PDF the installer puts on the unit, first; then the copy in the one-line
 # installer's checkout. Neither: the page on GitHub.
@@ -411,6 +429,7 @@ MANUAL_SECTIONS   = {
     "update":     ("sec7",    "7-updating-an-existing-unit"),
     "aes67":      ("sec13",   "13-aes67-network-audio-optional"),
     "bluetooth":  ("sec14",   "14-bluetooth-audio"),
+    "preview":    ("sec4.13", "413-preview-and-folding-panels"),
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3539,6 +3558,15 @@ h3{margin:0 0 10px;font-size:1.05em}
 .manual-links a{color:var(--link);text-decoration:none}
 .manual-links a:hover{text-decoration:underline}
 .card{background:var(--card);border-radius:10px;border:1px solid var(--border);padding:16px;margin-bottom:14px}
+/* folding panels: the heading toggles, the rest of the card is .card-body */
+.fold-h{cursor:pointer;user-select:none}
+.fold-h .fold-mark{display:inline-block;width:1.1em;color:var(--muted);font-size:0.85em}
+.card.folded .card-body{display:none}
+.card.folded h3{margin-bottom:0}
+/* preview */
+.pv-wrap{position:relative;max-width:640px;background:#000;border-radius:6px;overflow:hidden;aspect-ratio:16/9}
+.pv-wrap img{display:block;width:100%;height:100%;object-fit:contain}
+.pv-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#ccc;font-size:0.9em;text-align:center;padding:12px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .row label.lbl{width:150px;flex-shrink:0;font-size:0.95em}
 .row input[type=file]{flex:1;min-width:0;font-size:0.9em}
@@ -4427,8 +4455,81 @@ function toggleTheme(){
   try{localStorage.setItem('sawTheme',next);}catch(e){}
   themeLabel();
 }
+/* -- Folding panels --
+   Every card with a heading folds: the heading toggles, everything after it
+   goes into .card-body. Which are folded is kept in this browser only. Set
+   up from window.onload - the cards do not exist when this script runs. */
+let foldState={};
+function foldSave(){try{localStorage.setItem('sawFolded',JSON.stringify(foldState));}catch(e){}}
+function foldCard(card,folded){
+  card.classList.toggle('folded',folded);
+  const m=card.querySelector('.fold-mark');
+  if(m)m.textContent=folded?String.fromCharCode(9656):String.fromCharCode(9662);
+  if(card.id==='pvCard')previewRun(!folded);
+}
+function foldSetup(){
+  try{foldState=JSON.parse(localStorage.getItem('sawFolded')||'{}')||{};}catch(e){foldState={};}
+  document.querySelectorAll('.card').forEach(card=>{
+    const h=card.querySelector(':scope > h3');
+    if(!h||card.id==='logCard')return;
+    const key=card.dataset.fold||h.textContent.replace(/[^A-Za-z0-9 ]/g,'').replace('Help','').trim();
+    const body=document.createElement('div');
+    body.className='card-body';
+    while(h.nextSibling)body.appendChild(h.nextSibling);
+    card.appendChild(body);
+    h.classList.add('fold-h');
+    const mark=document.createElement('span');
+    mark.className='fold-mark';
+    h.insertBefore(mark,h.firstChild);
+    h.addEventListener('click',ev=>{
+      if(ev.target.closest('a'))return;          /* ? Help opens the manual, not the fold */
+      const f=!card.classList.contains('folded');
+      foldState[key]=f;foldSave();foldCard(card,f);
+    });
+    const saved=foldState[key];
+    foldCard(card,saved===undefined?card.dataset.foldDefault==='folded':saved);
+  });
+}
+
+/* -- Preview --
+   A frame every 10 s while the panel is open and this tab is visible: the
+   image is swapped in place, nothing else on the page reloads, so uploads
+   and the other panels carry on. */
+let pvOn=false,pvTimer=null,pvUrl=null;
+function previewRun(on){
+  pvOn=on;
+  if(pvTimer){clearTimeout(pvTimer);pvTimer=null;}
+  if(on&&!document.hidden)previewFetch();
+}
+async function previewFetch(){
+  pvTimer=null;
+  if(!pvOn||document.hidden)return;
+  const msg=document.getElementById('pvMsg'),img=document.getElementById('pvImg'),st=document.getElementById('pvSt');
+  try{
+    const r=await fetch('/preview.jpg',{cache:'no-store'});
+    if(r.ok){
+      const blob=await r.blob();
+      const url=URL.createObjectURL(blob);
+      img.src=url;
+      if(pvUrl)URL.revokeObjectURL(pvUrl);
+      pvUrl=url;
+      msg.style.display='none';
+      const pic=r.headers.get('X-Picture');
+      st.textContent='Frame taken at '+(r.headers.get('X-Taken')||'?')+(pic==='no'?' '+String.fromCharCode(8212)+' but the player has no video output: the screen shows nothing. See the System and Output Resolution panels.':'. Updates every 10 seconds.');
+      st.style.color=pic==='no'?'var(--warn-fg)':'';
+    }else{
+      const d=await r.json().catch(()=>({}));
+      msg.textContent='No preview: '+(d.message||'the unit did not answer');
+      msg.style.display='flex';
+    }
+  }catch(e){msg.textContent='No preview: the unit did not answer';msg.style.display='flex';}
+  if(pvOn&&!document.hidden)pvTimer=setTimeout(previewFetch,10000);
+}
+document.addEventListener('visibilitychange',()=>{if(pvOn&&!document.hidden&&!pvTimer)previewFetch();});
+
 window.onload=function(){
   themeLabel();
+  foldSetup();
   fetchStatus();fetchVolume();fetchSysInfo();
   fetchSlotStatus();loadAudioDevices();loadDisplayModes();fetchPlayerName();fetchMaxUpload();loadInstalledVersion();loadAes67();loadBt();
 }
@@ -4480,6 +4581,13 @@ document.documentElement.setAttribute('data-theme',t);})();
     <input type="range" id="volSlider" min="0" max="100" step="1" oninput="setVolume(this.value)">
     <span id="volVal">--%</span>
   </div>
+</div>
+
+<!-- ── Preview ── -->
+<div class="card" id="pvCard" data-fold="preview" data-fold-default="folded">
+  <h3>&#128247; Preview<a class="help" href="/manual?section=preview" target="_blank" rel="noopener">? Help</a></h3>
+  <div class="pv-wrap"><img id="pvImg" alt="A frame of what the player is showing"><div class="pv-msg" id="pvMsg">Waiting for the first frame&hellip;</div></div>
+  <div id="pvSt" class="audio-hint">A frame of what the player is playing, every 10 seconds while this panel is open. It is kept in the Pi's memory, never written to the SD card.</div>
 </div>
 
 <!-- ── System info ── -->
@@ -4686,7 +4794,7 @@ document.documentElement.setAttribute('data-theme',t);})();
 </div>
 
 <!-- ── Logs ── -->
-<div class="card">
+<div class="card" id="logCard">
   <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
     <h3 style="margin:0">📋 Logs — <span id="logSize" style="font-size:0.85em;font-weight:normal;color:var(--muted)">—</span></h3>
     <button id="logToggleBtn" class="btn btn-grey btn-sm" onclick="toggleLogPanel()">▼ Show Logs</button>
@@ -5315,6 +5423,78 @@ def logs_tail():
 # ══════════════════════════════════════════════════════════════════════════════
 # SYSTEM INFO + MANAGEMENT ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PREVIEW
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# The Preview panel asks for /preview.jpg every 10 s while it is open and its
+# tab visible; nobody looking, no grabs. mpv saves the frame it is playing
+# ("video": the decoded frame, without OSD) - measured on the bench at 56-89 ms
+# for 1080p with no dropped frames. It is what mpv is PLAYING, not what the
+# screen shows: with the screen off the preview still moves, which is why the
+# reply also says whether mpv has a video output at all.
+#
+# RAM only, never the SD card: the file lives in PREVIEW_DIR, and a grab is
+# refused unless that directory is on tmpfs. mpv writes a temporary name,
+# renamed into place, so a browser never reads half a picture. Failures are
+# not logged: the panel asks every 10 s (constraint 21).
+# ══════════════════════════════════════════════════════════════════════════════
+
+_preview_lock = threading.Lock()
+_preview_taken = 0.0
+
+def preview_dir_in_ram(path: Optional[str] = None, mounts: str = "/proc/mounts") -> bool:
+    """Whether `path` is on a RAM filesystem (tmpfs or ramfs), by the longest
+    mount point that contains it."""
+    path = os.path.realpath(path or PREVIEW_DIR)
+    best, fstype = "", ""
+    try:
+        with open(mounts) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt = parts[1].replace("\\040", " ")
+                if (path == mnt or path.startswith(mnt.rstrip("/") + "/")) and len(mnt) >= len(best):
+                    best, fstype = mnt, parts[2]
+    except Exception:
+        return False
+    return fstype in ("tmpfs", "ramfs")
+
+def preview_grab(now: Optional[float] = None) -> Tuple[bool, str]:
+    """A fresh frame into PREVIEW_FILE, unless one was taken within
+    PREVIEW_MIN_S. (ok, reason when not ok)."""
+    global _preview_taken
+    now = time.time() if now is None else now
+    with _preview_lock:
+        if now - _preview_taken < PREVIEW_MIN_S and os.path.exists(PREVIEW_FILE):
+            return True, ""
+        if not preview_dir_in_ram():
+            return False, "the preview is kept in RAM only, and %s is not RAM on this unit" % PREVIEW_DIR
+        with state_lock:
+            restarting = state.restart_in_progress
+        if restarting or not _mpv_is_running():
+            return False, "the video is not playing yet"
+        tmp = PREVIEW_FILE + ".tmp.jpg"     # the extension tells mpv the format
+        _mpv_send(["set_property", "screenshot-jpeg-quality", PREVIEW_QUALITY])
+        r = _mpv_send(["screenshot-to-file", tmp, "video"], timeout=5.0)
+        if not (r and r.get("error") == "success" and os.path.exists(tmp)):
+            return False, "mpv could not take a frame (%s)" % ((r or {}).get("error") or "no answer")
+        os.replace(tmp, PREVIEW_FILE)
+        _preview_taken = now
+        return True, ""
+
+@app.route("/preview.jpg")
+def preview_jpg():
+    ok, why = preview_grab()
+    if not ok:
+        return jsonify({"ok": False, "message": why}), 503
+    resp = send_file(PREVIEW_FILE, mimetype="image/jpeg", max_age=0)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Taken"] = time.strftime("%H:%M:%S", time.localtime(_preview_taken))
+    resp.headers["X-Picture"] = "yes" if mpv_get_property("vo-configured") is True else "no"
+    return resp
 
 # ══════════════════════════════════════════════════════════════════════════════
 # USER MANUAL

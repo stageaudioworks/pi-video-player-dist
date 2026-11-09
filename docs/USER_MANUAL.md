@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v19**. Features that arrived in a recent version
+**Applies to:** software version **v20**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -403,6 +403,26 @@ transfer that produces a zero-length or corrupt file is the usual cause:
 file /home/pi/saw.jpg     # should say "JPEG image data"
 ```
 
+### 4.13 Preview and folding panels
+
+**Preview** (v20). Open the **Preview** panel to see what the unit is playing: a
+frame every **10 seconds**, with the time it was taken. Nothing else on the page
+reloads, so uploads and the other panels carry on while it updates. It only
+fetches frames while the panel is open and the browser tab is in front — fold it,
+or switch tabs, and it stops.
+
+The frame is kept in the Pi's memory and is **never written to the SD card**. If a
+unit's memory area is not available, the panel says so and shows nothing.
+
+The preview is what the player is *playing*, not a camera on the screen: with
+the screen switched off it still moves. If the player has no picture on the
+screen at all, the caption says so — see the System and Output Resolution panels.
+
+**Folding panels.** Click a panel's title to fold it away, and again to open it.
+Each browser remembers which panels are folded, so each person can keep the page
+the way they like it. **? Help** on a title opens this manual without folding the
+panel.
+
 ---
 
 ## 5. The physical buttons
@@ -610,6 +630,7 @@ All endpoints are served on port 5000. No authentication.
 | `GET`  | `/update/version` | The installed version |
 | `GET`  | `/update/check` | Compare with the published release on GitHub |
 | `POST` | `/update/apply` | Download, verify and install a newer release |
+| `GET`  | `/preview.jpg` | A frame of what is playing (v20), kept in RAM; at most one new frame every 5 seconds. Header `X-Taken`: when it was taken. `503` with a reason when there is nothing to show. |
 | `GET`  | `/manual` | This manual: the copy on the unit, else GitHub's. `?section=aes67` (also `system`, `audio`, `resolution`, `videos`, `update`, `bluetooth`) opens that section; `?online=1` always opens GitHub's |
 | `GET`  | `/logs/tail` | Recent log lines |
 | `GET`  | `/logs/download` | Download the full log |
@@ -1114,5 +1135,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v19.*
+*Stage Audio Works — Raspberry Pi Video Player, v20.*
 *This software is provided with no warranty and no support. See `README.md`.*
