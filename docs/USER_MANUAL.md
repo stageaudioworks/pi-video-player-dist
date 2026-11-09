@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v20**. Features that arrived in a recent version
+**Applies to:** software version **v21**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -389,19 +389,12 @@ Have that ready before deploying to a unit you cannot easily reach.
 
 ### 4.12 Branding
 
-If `/home/pi/saw.jpg` exists, it is displayed in the page footer. The check runs
-**once at startup**, so restart the service after copying the file:
+The Stage Audio Works logo is **built into the player** (v21) and shown at the foot
+of every page — black in the light theme, white in the dark one. Nothing needs
+copying onto the unit.
 
-```bash
-sudo systemctl restart saw-player
-```
-
-If it does not appear, verify the file actually transferred as an image — a failed
-transfer that produces a zero-length or corrupt file is the usual cause:
-
-```bash
-file /home/pi/saw.jpg     # should say "JPEG image data"
-```
+Before v21 the logo came from a file, `/home/pi/saw.jpg`, so units without that
+file showed none. The file is no longer used and can be deleted.
 
 ### 4.13 Preview and folding panels
 
@@ -659,7 +652,6 @@ curl -X POST -H "Content-Type: application/json" \
 | Volume | `/home/pi/.mpv_volume` |
 | Audio device | `/home/pi/.mpv_audio_device` |
 | Output resolution | `/home/pi/.mpv_resolution` |
-| Branding image | `/home/pi/saw.jpg` |
 | This manual | `/home/pi/saw_manual.pdf` |
 | Console line with the web interface's address | `/etc/issue.d/saw-player.issue` |
 | systemd service | `saw-player` |
@@ -1135,5 +1127,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v20.*
+*Stage Audio Works — Raspberry Pi Video Player, v21.*
 *This software is provided with no warranty and no support. See `README.md`.*
