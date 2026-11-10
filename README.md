@@ -83,6 +83,14 @@ after install.
   drops out the player keeps trying — every few seconds for 20 attempts, then once a
   minute. Turning Bluetooth off sends the sound back to the previous output. Off
   until somebody turns it on.
+- **Handset reed switch** *(optional, off by default)*: GPIO 23. Putting the handset
+  back ends a clip; a button pressed while it hangs can wait for a pick-up.
+- **Central manager** *(optional)*: enter a SAW manager's address in the web UI's
+  Central Manager panel and the unit appears on its dashboard - status, remote
+  controls, clips sent from a library, player updates for units without internet.
+  The manager is a separate install for a Pi, a Linux VM or a Proxmox container:
+  [pi-video-player-server-dist](https://github.com/stageaudioworks/pi-video-player-server-dist).
+  Without an address, nothing is sent anywhere.
 - Everything is configurable through a Flask web UI on port **5000**; the unit is also
   controllable over the network via UDP on port **5505**.
 
@@ -230,7 +238,7 @@ cat /run/saw-aes67/bridge.json              # the bridge's view: PTP, card, drif
 
 ## Project state
 
-- `RPi_Video_Player_v22.py` — **current version.**
+- `RPi_Video_Player_v23.py` — **current version.**
 
 ## License
 

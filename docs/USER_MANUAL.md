@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v22**. Features that arrived in a recent version
+**Applies to:** software version **v23**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -1180,5 +1180,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v22.*
+*Stage Audio Works — Raspberry Pi Video Player, v23.*
 *This software is provided with no warranty and no support. See `README.md`.*

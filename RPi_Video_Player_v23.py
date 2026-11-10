@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v22)
+Stage Audio Works Raspberry Pi Video Player  (v23)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -80,6 +80,13 @@ Features:
     handset back ends a trigger clip; a button pressed while it hangs waits for
     a pick-up with an on-screen prompt (or plays, or is ignored - a setting);
     picking it up can start a trigger by itself.
+  • Central manager (v23, optional, off by default): enter the address of a
+    SAW manager (pi-video-player-server) and the unit reports its status there
+    every 10 s, takes the clips the manager assigns to its slots - pulled by
+    the unit, resumed if cut, checked against their SHA-256, swapped in like
+    an upload - runs its remote controls (the UDP commands, and volume), and
+    installs a newer player version it names. No address: no thread, no
+    network traffic.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -124,6 +131,11 @@ Handset endpoints:
   /reed            GET  — settings and the live state; POST — new settings
   /reed/fonts      GET  — fonts installed on the unit, for the prompt
   /reed/test_prompt POST — show the prompt on screen for 5 s
+
+Central manager endpoint:
+  /manager        GET  — the manager's address, this unit's id and the link's
+                         state (last contact, error, the clip being fetched)
+                  POST — {"server": "<address>[:port]"} to join, "" to leave
 
 Preview endpoint:
   /preview.jpg    GET  — a frame of what is playing (RAM only; at most one grab
@@ -175,6 +187,7 @@ import ctypes
 import ctypes.util
 import errno
 import hashlib
+import secrets
 import mmap
 import queue
 try:
@@ -517,7 +530,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 22
+PLAYER_VERSION = 23
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -557,6 +570,26 @@ UPDATE_BASE_OVERRIDE = os.environ.get("SAW_UPDATE_BASE", "").strip()
 # an update, a crash - takes the screen straight away.
 BOOT_CONSOLE_HOLD_S = 30
 BOOT_FRESH_S        = 120     # the system is this young: it has just booted
+
+# ── Central manager (see CENTRAL MANAGER) ─────────────────────────────────────
+MANAGER_PORT_DEFAULT  = 5080
+MANAGER_PROTOCOL      = 1
+MANAGER_INTERVAL_S    = 10          # until the manager says otherwise
+MANAGER_INTERVAL_MIN  = 5
+MANAGER_INTERVAL_MAX  = 300
+MANAGER_TIMEOUT       = (4, 8)      # heartbeat: connect, read
+MANAGER_FETCH_TIMEOUT = (6, 60)     # a clip: connect, between chunks
+MANAGER_MAX_REPLY     = 64 * 1024
+MANAGER_MAX_CLIP      = 32 * 1024 * 1024 * 1024
+MANAGER_RETRY_S       = (60, 120, 300, 900)   # after a failed fetch, then 900 for ever
+MANAGER_SLOTS         = ("loop", "trigger1", "trigger2", "trigger3", "override")
+MANAGER_WAIT_TIMEOUT  = (4, 45)     # the held request for commands: the manager answers within 25 s
+MANAGER_WAIT_RETRY_S  = 5           # after a failed wait (never logged - the heartbeat says it)
+# Remote controls: UDP_COMMANDS' actions, plus volume. Nothing else is run.
+MANAGER_ACTIONS       = ("play", "pause", "restart", "override_on", "override_off",
+                         "trigger_1", "trigger_2", "trigger_3", "volume")
+SERIAL_PATHS          = ("/sys/firmware/devicetree/base/serial-number",
+                         "/proc/device-tree/serial-number")
 
 # ── Preview (see PREVIEW) ─────────────────────────────────────────────────────
 # A frame of what mpv is playing, for the web UI. Written to RAM only: /dev/shm
@@ -3387,8 +3420,896 @@ def osd_fonts() -> list:
     return _fonts_cache
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CENTRAL MANAGER
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Optional (v23). The operator types a manager's address into the web UI; from
+# then on the unit POSTs a heartbeat to <manager>/api/v1/heartbeat every
+# MANAGER_INTERVAL_S: who it is, what it is playing, its health, and the
+# SHA-256 of the clip in each slot. The reply names the clip the manager wants
+# in each slot it manages - a hash and a size, nothing else. A slot that
+# differs is fetched from <manager>/api/v1/content/<sha256> into
+# VIDEO_DIR/.manager-<sha256>.part - resumed with a Range request after a cut -
+# checked, and swapped in with os.replace: the upload route's path, RAM pin
+# included. The reply may also name a player version: installed through
+# _deploy_script() if it is newer than this one, never while a trigger plays.
+# Remote controls (MANAGER_ACTIONS: UDP's actions plus volume, through
+# run_action()) arrive on a request the manager holds open, /api/v1/wait, so
+# they act within a second; the manager is the separate pi-video-player-server.
+#
+# Why the unit calls the manager, never the other way round:
+#   * joining is one field - nothing to set up on the manager;
+#   * it works through NAT and outbound-only firewalls;
+#   * the reply is a desired state, not a command: a unit that was off when a
+#     clip was assigned catches up when it is back, and a lost reply costs
+#     nothing - the next heartbeat asks again.
+#
+# Rules it keeps:
+#   * no address, no thread, no request (as the handset leaves GPIO 23 alone);
+#   * the manager is trusted for hashes and sizes only - the fetch URL is built
+#     here from the address the operator typed and a 64-hex hash; redirects are
+#     not followed; replies are size-capped; a clip must match its size and
+#     hash or it is thrown away and the slot keeps what it had;
+#   * log changes of state, not attempts (constraint 21);
+#   * nothing written to the SD card per heartbeat - only the clips themselves,
+#     and config.json when the address or the key changes;
+#   * identity comes from the Pi's serial number, not from config.json: units
+#     are deployed by cloning SD cards, and an id kept in the config would make
+#     every clone the same unit on the manager.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MANAGER_HOST_RE = re.compile(
+    r"^(?:\[[0-9A-Fa-f:.]{2,45}\]"
+    r"|[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}))*)$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MANAGER_KEY_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+class ManagerError(Exception):
+    """A problem with the central manager, worded to be shown as-is."""
+
+
+def manager_parse_address(text) -> Optional[str]:
+    """
+    The operator's entry -> a base URL "http://host:port", or None if it is not
+    an address. Takes an IPv4 address, "<ip>:8080", "saw-manager.local",
+    "http://<ip>:5080/" and https:// forms (behind a reverse proxy).
+    No scheme, or http:// without a port -> MANAGER_PORT_DEFAULT; https:// -> 443.
+    No paths, no user:password, nothing that is not a host.
+    """
+    if not isinstance(text, str):
+        return None
+    t = text.strip()
+    if not t or len(t) > 200 or any(c.isspace() for c in t):
+        return None
+    scheme, port = "http", MANAGER_PORT_DEFAULT
+    m = re.match(r"^(https?)://(.*)$", t, re.I)
+    if m:
+        scheme, t = m.group(1).lower(), m.group(2)
+        if scheme == "https":
+            port = 443
+    t = t.rstrip("/")
+    if not t or any(c in t for c in "/@?#\\"):
+        return None
+    if t.startswith("["):
+        end = t.find("]")
+        if end < 0:
+            return None
+        host, rest = t[:end + 1], t[end + 1:]
+    else:
+        host, colon, p = t.partition(":")
+        rest = ":" + p if colon else ""
+    if rest:
+        if not re.fullmatch(r":\d{1,5}", rest):
+            return None
+        port = int(rest[1:])
+        if not 1 <= port <= 65535:
+            return None
+    if not _MANAGER_HOST_RE.match(host):
+        return None
+    return "%s://%s:%d" % (scheme, host.lower(), port)
+
+
+def manager_unit_id(serial_paths=SERIAL_PATHS, net_dir: str = "/sys/class/net",
+                    hostname: Optional[str] = None) -> str:
+    """
+    This unit's id on the manager: "pi-<serial>" from the SoC's serial number,
+    which a cloned SD card does not carry across; else "mac-<MAC>" of the wired
+    port; else "host-<hostname>" (a test machine).
+    """
+    for p in serial_paths:
+        try:
+            with open(p, "rb") as f:
+                raw = f.read(64)
+        except OSError:
+            continue
+        s = re.sub(r"[^0-9a-f]", "", raw.split(b"\0")[0].decode("ascii", "ignore").lower())
+        if s.strip("0"):
+            return "pi-" + s[-16:]
+    for iface in ("eth0", "end0", "wlan0"):
+        try:
+            with open(os.path.join(net_dir, iface, "address")) as f:
+                mac = f.read().strip().lower()
+        except OSError:
+            continue
+        if re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac) and mac.replace(":", "").strip("0"):
+            return "mac-" + mac.replace(":", "")
+    name = re.sub(r"[^a-z0-9-]", "", (hostname or socket.gethostname()).lower())[:40]
+    return "host-" + (name or "unknown")
+
+
+def manager_play_status(mpv: dict, override: bool, trigger_running: bool, video,
+                        restarting: bool, display) -> dict:
+    """What the dashboard shows for this unit: state (playing / paused /
+    stopped / starting / no_screen / unknown), mode (loop / trigger /
+    override), which trigger, the clip, position and length in seconds."""
+    if restarting:
+        st = "starting"
+    elif display is False:
+        st = "no_screen"
+    else:
+        st = mpv.get("state") or "unknown"
+    mode = "override" if override else ("trigger" if trigger_running else "loop")
+    trig = None
+    if mode == "trigger" and isinstance(video, str):
+        m = re.match(r"^trigger(\d+)\.", video)
+        trig = int(m.group(1)) if m else None
+    return {"state": st, "mode": mode, "trigger": trig, "video": video,
+            "position": int(mpv.get("time") or 0), "length": int(mpv.get("length") or 0),
+            "volume": mpv.get("volume")}
+
+
+def manager_slot_paths() -> dict:
+    with state_lock:
+        override = state.override_video
+    return {"loop": LOOP_VIDEO,
+            "trigger1": TRIGGER_VIDEOS[GPIO_PINS[0]],
+            "trigger2": TRIGGER_VIDEOS[GPIO_PINS[1]],
+            "trigger3": TRIGGER_VIDEOS[GPIO_PINS[2]],
+            "override": override}
+
+
+def manager_clean_desired(raw) -> dict:
+    """The reply's "content" -> {slot: {"sha256", "size"}}, well-formed entries
+    for known slots only. Anything else in it is ignored."""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for slot, item in raw.items():
+        if slot not in MANAGER_SLOTS or not isinstance(item, dict):
+            continue
+        sha, size = item.get("sha256"), item.get("size")
+        if (isinstance(sha, str) and _SHA256_RE.match(sha)
+                and isinstance(size, int) and not isinstance(size, bool)
+                and 0 < size <= MANAGER_MAX_CLIP):
+            out[slot] = {"sha256": sha, "size": size}
+    return out
+
+
+def manager_plan(desired: dict, have: dict) -> list:
+    """[(slot, item)] whose clip differs from the manager's, loop first.
+    A slot the manager does not name is left alone."""
+    return [(s, desired[s]) for s in MANAGER_SLOTS
+            if s in desired and (have.get(s) or {}).get("sha256") != desired[s]["sha256"]]
+
+
+def manager_clean_commands(raw) -> list:
+    """The manager's remote-control commands -> [{"id", "action", "volume"?}],
+    well-formed ones only. An action outside MANAGER_ACTIONS is dropped: the
+    manager can do what UDP can do, and set the volume - nothing more."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for c in raw[:20]:
+        if not isinstance(c, dict):
+            continue
+        cid, action = c.get("id"), c.get("action")
+        if not (isinstance(cid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", cid)
+                and action in MANAGER_ACTIONS):
+            continue
+        item = {"id": cid, "action": action}
+        if action == "volume":
+            v = c.get("volume")
+            if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 100:
+                continue
+            item["volume"] = v
+        out.append(item)
+    return out
+
+
+def manager_clean_player(raw) -> Optional[dict]:
+    """The player version the manager wants here -> {"version", "sha256",
+    "size"}, or None. Whether to install it is decided on the unit."""
+    if not isinstance(raw, dict):
+        return None
+    v, sha, size = raw.get("version"), raw.get("sha256"), raw.get("size")
+    if (isinstance(v, int) and not isinstance(v, bool) and v > 0
+            and isinstance(sha, str) and _SHA256_RE.match(sha)
+            and isinstance(size, int) and not isinstance(size, bool)
+            and 0 < size <= UPDATE_MAX_SCRIPT):
+        return {"version": v, "sha256": sha, "size": size}
+    return None
+
+
+def manager_retry_delay(failures: int) -> int:
+    return MANAGER_RETRY_S[min(max(failures, 1), len(MANAGER_RETRY_S)) - 1]
+
+
+def _manager_local_address(base: str) -> Optional[str]:
+    """The address this unit uses to reach the manager - the one a browser
+    next to the manager is most likely to reach it on. No packet is sent."""
+    m = re.match(r"^https?://(\[[^\]]+\]|[^:/]+):(\d+)$", base or "")
+    if not m:
+        return None
+    host = m.group(1).strip("[]")
+    try:
+        fam, _, _, _, addr = socket.getaddrinfo(host, int(m.group(2)), 0, socket.SOCK_DGRAM)[0]
+        s = socket.socket(fam, socket.SOCK_DGRAM)
+        try:
+            s.connect(addr)
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return None
+
+
+def _read_capped(r, cap: int) -> bytes:
+    buf = bytearray()
+    for chunk in r.iter_content(8192):
+        buf += chunk
+        if len(buf) > cap:
+            raise ManagerError("the manager's reply is too large")
+    return bytes(buf)
+
+
+def _manager_request_error(e: Exception) -> str:
+    if isinstance(e, ManagerError):
+        return str(e)
+    if isinstance(e, requests.exceptions.Timeout):
+        return "no answer (timed out)"
+    if isinstance(e, requests.exceptions.SSLError):
+        return "secure connection failed - check the unit's clock with 'date'"
+    if isinstance(e, requests.exceptions.ConnectionError):
+        text = str(e)
+        if "Connection refused" in text or "Errno 111" in text:
+            return "connection refused - is the manager running, and on that port?"
+        if "Name or service not known" in text or "Temporary failure in name resolution" in text:
+            return "that name does not resolve - try the manager's IP address"
+        return "unreachable"
+    if isinstance(e, OSError):
+        return "%s (%s)" % (e.strerror or type(e).__name__, getattr(e, "filename", "") or "")
+    return type(e).__name__
+
+
+class FileHashCache:
+    """SHA-256 of each slot's clip, worked out again only when the file changes
+    (size, mtime or inode) - a 1 GB clip takes about a second on a Pi 5, once."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache = {}
+
+    @staticmethod
+    def _key(st):
+        return (st.st_size, st.st_mtime_ns, st.st_ino)
+
+    def get(self, path: str) -> Optional[dict]:
+        try:
+            before = os.stat(path)
+        except OSError:
+            return None
+        key = self._key(before)
+        with self._lock:
+            hit = self._cache.get(path)
+        if hit and hit[0] == key:
+            return hit[1]
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            after = os.stat(path)
+        except OSError:
+            return None
+        if self._key(after) != key:
+            return None                    # replaced while reading - next time
+        value = {"sha256": h.hexdigest(), "size": before.st_size}
+        with self._lock:
+            self._cache[path] = (key, value)
+        return value
+
+    def put(self, path: str, sha: str, size: int):
+        """A clip just fetched and checked: no need to read it again."""
+        try:
+            key = self._key(os.stat(path))
+        except OSError:
+            return
+        with self._lock:
+            self._cache[path] = (key, {"sha256": sha, "size": size})
+
+
+class ManagerClient:
+    """
+    Three threads, none of which exists until an address is set:
+      * "manager"       - the heartbeat, every MANAGER_INTERVAL_S;
+      * "manager-wait"  - a request the manager holds open until it has a
+                          command (or 25 s pass), so a button on the dashboard
+                          acts within a second, through NAT, without the
+                          manager ever connecting to the unit;
+      * "manager-fetch" - one download at a time (a clip, or a player version),
+                          so a long download never holds up the heartbeat.
+    """
+
+    def __init__(self):
+        self._lock      = threading.Lock()
+        self._wake      = threading.Event()     # heartbeat now
+        self._wait_wake = threading.Event()     # the wait loop: something changed
+        self._thread    = None
+        self._waiter    = None
+        self._hashes    = FileHashCache()
+        self._unit_id   = None
+        self._interval  = MANAGER_INTERVAL_S
+        self._fetching  = False
+        self._retry     = {}      # slot or "player" -> {"sha256", "failures", "at", "error"}
+        self._crashed   = False
+        self._results   = []      # command results not yet reported
+        self._seen      = []      # command ids already run (a command never runs twice)
+        self._wait_ok   = False   # the manager offers /api/v1/wait
+        self._reset_link("")
+
+    def _reset_link(self, server: str):
+        self._link = {"server": server, "connected": None, "last_ok": None,
+                      "since": None, "error": "", "server_name": "",
+                      "managed": [], "job": None, "player": None}
+
+    # ── settings and identity ────────────────────────────────────────────────
+    @staticmethod
+    def settings() -> dict:
+        m = config.get("manager") or {}
+        return {"server": m.get("server") or ""}
+
+    def unit_id(self) -> str:
+        if self._unit_id is None:
+            self._unit_id = manager_unit_id()
+        return self._unit_id
+
+    def key(self) -> str:
+        """The secret the manager pins to this unit on first contact. Made on
+        this unit, kept in config.json - and made again when the config came
+        from another unit's card (key_for is not this unit's id)."""
+        uid = self.unit_id()
+        m = dict(config.get("manager") or {})
+        if m.get("key_for") != uid or not _MANAGER_KEY_RE.match(str(m.get("key", ""))):
+            m["key"], m["key_for"] = secrets.token_hex(16), uid
+            config["manager"] = m
+            save_config(dict(config))
+        return m["key"]
+
+    def _auth(self) -> dict:
+        return {"X-SAW-Unit": self.unit_id(), "X-SAW-Key": self.key()}
+
+    def apply(self):
+        """The address changed, or the player started: start the threads the
+        first time there is an address, and wake them."""
+        server = self.settings()["server"]
+        start = False
+        with self._lock:
+            if self._link["server"] != server:
+                self._reset_link(server)
+                self._retry = {}
+                self._wait_ok = False
+            if server and self._thread is None:
+                self._thread = threading.Thread(target=self._run, daemon=True, name="manager")
+                self._waiter = threading.Thread(target=self._wait_loop, daemon=True,
+                                                name="manager-wait")
+                start = True
+        if start:
+            self._thread.start()
+            self._waiter.start()
+        self._wake.set()
+        self._wait_wake.set()
+
+    # ── the heartbeat ────────────────────────────────────────────────────────
+    def _run(self):
+        self._remove_leftovers()
+        while True:
+            self._wake.clear()
+            server = self.settings()["server"]
+            if not server:
+                self._wake.wait()          # left the manager: nothing at all until rejoined
+                continue
+            try:
+                self.beat(server)
+            except Exception:
+                if not self._crashed:      # once - this loop runs for the life of the unit
+                    logger.exception("Central manager: heartbeat failed unexpectedly")
+                    self._crashed = True
+            self._wake.wait(self._interval)
+
+    def payload(self, server: str) -> dict:
+        mpv = get_mpv_status()
+        with state_lock:
+            override   = state.override_active
+            trig       = state.trigger_running
+            video      = state.current_trigger_video if trig else state.current_video
+            restarting = state.restart_in_progress
+        play = manager_play_status(mpv, override, trig, video, restarting, display_connected())
+        paths = manager_slot_paths()
+        content = {slot: self._hashes.get(paths[slot]) for slot in MANAGER_SLOTS}
+        try:
+            temp_c = float(re.sub(r"[^0-9.]", "", _get_cpu_temp()) or "nan")
+        except ValueError:
+            temp_c = None
+        try:
+            du = shutil.disk_usage(VIDEO_DIR)
+            disk = {"free_mb": du.free // _MB, "total_mb": du.total // _MB}
+        except OSError:
+            disk = None
+        power = _get_power()
+        with self._lock:
+            job = dict(self._link["job"]) if self._link["job"] else None
+            failed = {s: {"sha256": r["sha256"], "error": r["error"]}
+                      for s, r in self._retry.items()}
+            results = list(self._results)
+        return {
+            "protocol": MANAGER_PROTOCOL,
+            "unit_id":  self.unit_id(),
+            "key":      self.key(),
+            "name":     _player_name,
+            "hostname": socket.gethostname(),
+            "version":  PLAYER_VERSION,
+            "web_port": 5000,
+            "address":  _manager_local_address(server),
+            "status":   play,
+            "health":   {"temp_c": temp_c if temp_c == temp_c else None,
+                         "uptime_s": int(_uptime_s() or 0),
+                         "undervoltage": bool(power.get("now")),
+                         "undervoltage_since_boot": bool(power.get("since_boot")),
+                         "disk": disk},
+            "content":  content,
+            "job":      job,
+            "failed":   failed,
+            "results":  results,
+        }
+
+    def _post(self, server: str, path: str, body: dict, timeout) -> Tuple[int, dict]:
+        with requests.post(server + path, json=body, timeout=timeout,
+                           allow_redirects=False, stream=True) as r:
+            raw = _read_capped(r, MANAGER_MAX_REPLY)
+            code = r.status_code
+        try:
+            reply = json.loads(raw.decode("utf-8")) if raw else {}
+        except ValueError:
+            reply = {}
+        return code, reply if isinstance(reply, dict) else {}
+
+    def beat(self, server: str):
+        body = self.payload(server)
+        try:
+            code, reply = self._post(server, "/api/v1/heartbeat", body, MANAGER_TIMEOUT)
+            if code == 403:
+                raise ManagerError("the manager refused this unit: %s"
+                                   % str(reply.get("error") or "no reason given")[:200])
+            if code != 200 or reply.get("ok") is not True:
+                raise ManagerError("not a SAW manager, or a fault there (HTTP %d)" % code)
+        except Exception as e:
+            self._link_changed(server, False, _manager_request_error(e))
+            return
+        sent = {r["id"] for r in body["results"]}
+        with self._lock:
+            self._results = [r for r in self._results if r["id"] not in sent]
+        try:
+            self._interval = min(MANAGER_INTERVAL_MAX,
+                                 max(MANAGER_INTERVAL_MIN, int(reply.get("interval"))))
+        except (TypeError, ValueError):
+            self._interval = MANAGER_INTERVAL_S
+        desired = manager_clean_desired(reply.get("content"))
+        player = manager_clean_player(reply.get("player"))
+        self._link_changed(server, True, "", str(reply.get("server_name") or "")[:64],
+                           sorted(desired, key=MANAGER_SLOTS.index), player)
+        if reply.get("wait") is True and not self._wait_ok:
+            self._wait_ok = True
+            self._wait_wake.set()
+        self.run_commands(reply.get("commands"))
+        self._maybe_fetch(server, desired, body["content"], player)
+
+    def _link_changed(self, server: str, ok: bool, error: str, server_name: str = "",
+                      managed=None, player=None):
+        now = time.time()
+        with self._lock:
+            if self._link["server"] != server:
+                return                     # the address changed while this was in flight
+            was = self._link["connected"]
+            since = self._link["since"]
+            self._link["error"] = error
+            if ok:
+                self._link.update(connected=True, last_ok=now, server_name=server_name,
+                                  managed=managed or [], player=player)
+            else:
+                self._link["connected"] = False
+            if was is not ok:
+                self._link["since"] = now
+        if ok and was is not True:
+            if was is False and since:
+                logger.info("Central manager: %s answering again (after %d min)",
+                            server, int((now - since) // 60))
+            else:
+                logger.info("Central manager: connected to %s (%s)", server,
+                            server_name or "no name")
+        elif not ok and was is not False:
+            logger.warning("Central manager: %s - %s. Trying every %d s; logged again "
+                           "once it answers.", server, error.rstrip("."), self._interval)
+
+    # ── remote controls ──────────────────────────────────────────────────────
+    def _wait_loop(self):
+        """Holds a request open on the manager; it answers the moment it has a
+        command for this unit. Idle while there is no address, while the
+        heartbeat is failing (it reports that), or with a manager without
+        /api/v1/wait. Never logs: the heartbeat already says when the
+        manager cannot be reached."""
+        while True:
+            server = self.settings()["server"]
+            with self._lock:
+                ready = (bool(server) and self._wait_ok and self._link["server"] == server
+                         and self._link["connected"] is True)
+            if not ready:
+                self._wait_wake.wait(MANAGER_INTERVAL_S)
+                self._wait_wake.clear()
+                continue
+            try:
+                code, reply = self._post(server, "/api/v1/wait",
+                                         {"unit_id": self.unit_id(), "key": self.key()},
+                                         MANAGER_WAIT_TIMEOUT)
+            except Exception:
+                time.sleep(MANAGER_WAIT_RETRY_S)
+                continue
+            if code == 404:
+                self._wait_ok = False      # a manager without it: heartbeats carry commands
+                continue
+            if code != 200:
+                time.sleep(MANAGER_WAIT_RETRY_S)
+                continue
+            self.run_commands(reply.get("commands"))
+
+    def run_commands(self, raw):
+        """Run the manager's commands - each id once - and report the results
+        with the next heartbeat, which is brought forward so the dashboard
+        shows the new state at once."""
+        ran = False
+        for c in manager_clean_commands(raw):
+            with self._lock:
+                if c["id"] in self._seen:
+                    continue
+                self._seen = (self._seen + [c["id"]])[-200:]
+            ok, msg = True, ""
+            try:
+                if c["action"] == "volume":
+                    set_volume(c["volume"])
+                    msg = "volume %d" % c["volume"]
+                else:
+                    with state_lock:
+                        blocked = state.override_active and c["action"].startswith("trigger_")
+                    run_action(c["action"], "manager")
+                    if blocked:
+                        ok, msg = False, "override is on - triggers are ignored"
+            except Exception as e:
+                ok, msg = False, "%s: %s" % (type(e).__name__, e)
+                logger.warning("Central manager: %s failed - %s", c["action"], msg)
+            with self._lock:
+                self._results = (self._results + [{"id": c["id"], "ok": ok,
+                                                   "message": msg[:200]}])[-50:]
+            ran = True
+        if ran:
+            self._wake.set()
+
+    # ── clips and player versions ────────────────────────────────────────────
+    def _maybe_fetch(self, server: str, desired: dict, have: dict, player=None):
+        now = time.monotonic()
+        wanted = dict(desired)
+        if player and player["version"] > PLAYER_VERSION:
+            wanted["player"] = player
+        with state_lock:                    # never restart the player mid-clip
+            busy = state.trigger_running or state.restart_in_progress
+        with self._lock:
+            # forget failures for things the manager no longer wants
+            for key in list(self._retry):
+                if (wanted.get(key) or {}).get("sha256") != self._retry[key]["sha256"]:
+                    del self._retry[key]
+            if self._fetching:
+                return
+            todo = [(s, it) for s, it in manager_plan(desired, have)
+                    if not (s in self._retry and now < self._retry[s]["at"])]
+            if not todo and "player" in wanted and not busy and not (
+                    "player" in self._retry and now < self._retry["player"]["at"]):
+                todo = [("player", wanted["player"])]
+            if not todo:
+                self._prune_parts({it["sha256"] for it in desired.values()})
+                return
+            slot, item = todo[0]
+            self._fetching = True
+            self._link["job"] = {"slot": slot, "sha256": item["sha256"],
+                                 "size": item["size"], "done": 0}
+        target = self._update_player if slot == "player" else self._fetch
+        threading.Thread(target=target, args=(server, slot, item),
+                         daemon=True, name="manager-fetch").start()
+
+    @staticmethod
+    def _part_path(sha: str) -> str:
+        return os.path.join(VIDEO_DIR, ".manager-%s.part" % sha)
+
+    def _fetch(self, server: str, slot: str, item: dict):
+        """A clip, resumed where an earlier try stopped: the partial file is
+        kept (named after the hash) and the manager is asked for the rest with
+        a Range request. Swapped in only once its size and hash are right."""
+        sha, size = item["sha256"], item["size"]
+        dest = manager_slot_paths()[slot]
+        part = self._part_path(sha)
+        keep_part = True
+        try:
+            try:
+                have = os.path.getsize(part)
+            except OSError:
+                have = 0
+            if have > size:
+                os.unlink(part)
+                have = 0
+            room = _get_max_upload_bytes(VIDEO_DIR)
+            if size - have > room:
+                raise ManagerError("not enough space: the clip needs %.0f MB more, %.0f MB "
+                                   "can be used" % ((size - have) / _MB, room / _MB))
+            h = hashlib.sha256()
+            if have:
+                with open(part, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+            if have < size:
+                headers = self._auth()
+                if have:
+                    headers["Range"] = "bytes=%d-" % have
+                with requests.get("%s/api/v1/content/%s" % (server, sha), headers=headers,
+                                  stream=True, timeout=MANAGER_FETCH_TIMEOUT,
+                                  allow_redirects=False) as r:
+                    if (r.status_code == 206 and have
+                            and r.headers.get("Content-Range", "").startswith("bytes %d-" % have)):
+                        mode = "ab"
+                    elif r.status_code == 200:
+                        mode, have, h = "wb", 0, hashlib.sha256()
+                    else:
+                        raise ManagerError("the manager answered HTTP %d for the clip"
+                                           % r.status_code)
+                    got = have
+                    with self._lock:
+                        if self._link["job"]:
+                            self._link["job"].update(done=got, resumed_from=have)
+                    with open(part, mode) as f:
+                        for chunk in r.iter_content(1 << 20):
+                            if not chunk:
+                                continue
+                            got += len(chunk)
+                            if got > size:
+                                keep_part = False
+                                raise ManagerError("the manager sent more than the clip's size")
+                            h.update(chunk)
+                            f.write(chunk)
+                            with self._lock:
+                                if self._link["job"]:
+                                    self._link["job"]["done"] = got
+                        f.flush()
+                        os.fsync(f.fileno())
+                if got != size:
+                    raise ManagerError("the download stopped at %d of %d bytes - it carries "
+                                       "on from there next time" % (got, size))
+            if h.hexdigest() != sha:
+                keep_part = False
+                raise ManagerError("the clip arrived damaged (checksum mismatch) - discarded")
+            os.replace(part, dest)
+            keep_part = False
+            self._hashes.put(dest, sha, size)
+            with self._lock:
+                had = self._retry.pop(slot, None)
+            logger.info("Central manager: new %s clip in place (%.1f MB, %s)%s", slot,
+                        size / _MB, sha[:12], " after %d failed tries" % had["failures"] if had else "")
+            ram_pinner.request("manager %s" % slot)
+            self._show_if_on_screen(dest)
+        except Exception as e:
+            if not keep_part:
+                try:
+                    os.unlink(part)
+                except OSError:
+                    pass
+            self._failed(slot, sha, _manager_request_error(e))
+        finally:
+            self._done()
+
+    def _update_player(self, server: str, slot: str, item: dict):
+        """A newer player version from the manager - for units with no route to
+        GitHub. Never older or the same (constraint 16). The script must match
+        the hash and size, declare the version the manager named, and pass the
+        same checks as a manual upload; then _deploy_script() - the one path
+        that replaces the running script - installs it and restarts."""
+        sha, version = item["sha256"], item["version"]
+        try:
+            with requests.get("%s/api/v1/player/%s" % (server, sha), headers=self._auth(),
+                              stream=True, timeout=MANAGER_FETCH_TIMEOUT,
+                              allow_redirects=False) as r:
+                if r.status_code != 200:
+                    raise ManagerError("the manager answered HTTP %d for the player script"
+                                       % r.status_code)
+                content = _read_capped(r, UPDATE_MAX_SCRIPT)
+            if len(content) != item["size"] or hashlib.sha256(content).hexdigest() != sha:
+                raise ManagerError("the player script arrived damaged (checksum mismatch)")
+            declared = _script_version(content)
+            if declared != version:
+                raise ManagerError("the script declares v%s, the manager said v%d"
+                                   % (declared, version))
+            if version <= PLAYER_VERSION:
+                raise ManagerError("v%d is not newer than this unit's v%d" % (version, PLAYER_VERSION))
+            logger.info("Central manager: installing player v%d (this unit runs v%d)",
+                        version, PLAYER_VERSION)
+            ok, msg, _code = _deploy_script(content, "the central manager")
+            if not ok:
+                raise ManagerError("not installed: %s" % msg)
+        except Exception as e:
+            self._failed("player", sha, _manager_request_error(e))
+        finally:
+            self._done()
+
+    def _failed(self, key: str, sha: str, msg: str):
+        with self._lock:
+            prev = self._retry.get(key)
+            failures = prev["failures"] + 1 if prev and prev["sha256"] == sha else 1
+            delay = manager_retry_delay(failures)
+            self._retry[key] = {"sha256": sha, "failures": failures,
+                                "at": time.monotonic() + delay, "error": msg}
+        what = "the player update" if key == "player" else "the %s clip" % key
+        if failures == 1 or (prev and prev["error"] != msg):
+            logger.warning("Central manager: could not fetch %s: %s. Trying again in %d s, "
+                           "and less often after that; logged again only if the reason "
+                           "changes.", what, msg, delay)
+
+    def _done(self):
+        with self._lock:
+            self._fetching = False
+            self._link["job"] = None
+        self._wake.set()                   # report it, and start on the next one
+
+    @staticmethod
+    def _show_if_on_screen(dest: str):
+        """A new loop (or override) clip goes on screen at once, as the operator
+        would expect from the dashboard. A trigger mid-clip is left alone: its
+        end loads the loop afresh from the new file anyway."""
+        with state_lock:
+            busy = state.trigger_running or state.restart_in_progress
+        if busy:
+            return
+        path, loop = _desired_video()
+        if path == dest:
+            switch_video(path, loop=loop)
+
+    @staticmethod
+    def _remove_leftovers():
+        """Temp files of an older client. Partial downloads (.part) are kept:
+        they resume, or _prune_parts removes them once nothing wants them."""
+        try:
+            for name in os.listdir(VIDEO_DIR):
+                if name.startswith(".manager-") and name.endswith(".tmp"):
+                    os.unlink(os.path.join(VIDEO_DIR, name))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _prune_parts(wanted: set):
+        try:
+            for name in os.listdir(VIDEO_DIR):
+                m = re.fullmatch(r"\.manager-([0-9a-f]{64})\.part", name)
+                if m and m.group(1) not in wanted:
+                    os.unlink(os.path.join(VIDEO_DIR, name))
+        except OSError:
+            pass
+
+    # ── for the web UI ───────────────────────────────────────────────────────
+    def status(self) -> dict:
+        now, mono = time.time(), time.monotonic()
+        with self._lock:
+            link = dict(self._link)
+            job = dict(link["job"]) if link["job"] else None
+            failed = {s: {"error": r["error"], "retry_in": max(0, int(r["at"] - mono))}
+                      for s, r in self._retry.items()}
+        player = link["player"]
+        return {
+            "server":      link["server"],
+            "unit_id":     self.unit_id(),
+            "connected":   link["connected"],
+            "last_ok_ago": None if link["last_ok"] is None else round(now - link["last_ok"], 1),
+            "since_ago":   None if link["since"] is None else round(now - link["since"], 1),
+            "error":       link["error"],
+            "server_name": link["server_name"],
+            "managed":     link["managed"],
+            "job":         job,
+            "failed":      failed,
+            "interval":    self._interval,
+            "player_target": player["version"] if player and player["version"] > PLAYER_VERSION else None,
+            "remote_controls": self._wait_ok,
+        }
+
+
+manager_client = ManagerClient()
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UDP LISTENER
 # ══════════════════════════════════════════════════════════════════════════════
+
+def run_action(action: str, source: str = "udp"):
+    """
+    One show-control action - a UDP_COMMANDS value. The UDP listener and the
+    central manager's remote controls both come here, so a command from the
+    manager behaves exactly like the same one over UDP (v23: moved out of
+    udp_listener unchanged, apart from naming its source in the log).
+    """
+    via = {"udp": "UDP", "manager": "the central manager"}.get(source, source)
+
+    if action == "play":
+        mpv_set_property("pause", False)
+        with state_lock:
+            state.paused = False
+
+    elif action == "pause":
+        mpv_set_property("pause", True)
+        with state_lock:
+            state.paused = True
+
+    elif action == "restart":
+        with state_lock:
+            state.restart_in_progress = True
+        try:
+            path, loop = _desired_video()
+            switch_video(path, loop=loop)
+        finally:
+            with state_lock:
+                state.restart_in_progress = False
+
+    elif action == "override_on":
+        with state_lock:
+            state.override_active     = True
+            config["override_active"] = True
+            ov                        = state.override_video
+            cfg_snap                  = dict(config)
+        logger.info("Override ACTIVATED via %s — switching to: %s",
+                    via, os.path.basename(ov))
+        save_config(cfg_snap)
+        if os.path.exists(ov):
+            switch_video(ov, loop=True)
+        else:
+            logger.warning("Override video not found: %s", ov)
+
+    elif action == "override_off":
+        with state_lock:
+            state.override_active     = False
+            config["override_active"] = False
+            cfg_snap                  = dict(config)
+        logger.info("Override DEACTIVATED via %s — returning to loop", via)
+        save_config(cfg_snap)
+        if os.path.exists(LOOP_VIDEO):
+            switch_video(LOOP_VIDEO, loop=True)
+        else:
+            logger.warning("Loop video not found: %s", LOOP_VIDEO)
+
+    elif action in ("trigger_1", "trigger_2", "trigger_3"):
+        # Map action string to GPIO pin number then fire play_trigger
+        # in a daemon thread — identical behaviour to a physical button press.
+        pin_map = {
+            "trigger_1": GPIO_PINS[0],
+            "trigger_2": GPIO_PINS[1],
+            "trigger_3": GPIO_PINS[2],
+        }
+        pin = pin_map[action]
+        logger.info("%s trigger command: %s → pin %s", via, action, pin)
+        threading.Thread(
+            target=play_trigger, args=(pin, "udp"),   # show control: never held back
+            daemon=True, name=f"{source}-trigger-{pin}",
+        ).start()
+
 
 def udp_listener():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -3406,67 +4327,7 @@ def udp_listener():
             if cmd not in UDP_COMMANDS:
                 continue
             action = UDP_COMMANDS[cmd]
-
-            if action == "play":
-                mpv_set_property("pause", False)
-                with state_lock:
-                    state.paused = False
-
-            elif action == "pause":
-                mpv_set_property("pause", True)
-                with state_lock:
-                    state.paused = True
-
-            elif action == "restart":
-                with state_lock:
-                    state.restart_in_progress = True
-                try:
-                    path, loop = _desired_video()
-                    switch_video(path, loop=loop)
-                finally:
-                    with state_lock:
-                        state.restart_in_progress = False
-
-            elif action == "override_on":
-                with state_lock:
-                    state.override_active     = True
-                    config["override_active"] = True
-                    ov                        = state.override_video
-                    cfg_snap                  = dict(config)
-                logger.info("Override ACTIVATED via UDP — switching to: %s",
-                            os.path.basename(ov))
-                save_config(cfg_snap)
-                if os.path.exists(ov):
-                    switch_video(ov, loop=True)
-                else:
-                    logger.warning("Override video not found: %s", ov)
-
-            elif action == "override_off":
-                with state_lock:
-                    state.override_active     = False
-                    config["override_active"] = False
-                    cfg_snap                  = dict(config)
-                logger.info("Override DEACTIVATED via UDP — returning to loop")
-                save_config(cfg_snap)
-                if os.path.exists(LOOP_VIDEO):
-                    switch_video(LOOP_VIDEO, loop=True)
-                else:
-                    logger.warning("Loop video not found: %s", LOOP_VIDEO)
-
-            elif action in ("trigger_1", "trigger_2", "trigger_3"):
-                # Map action string to GPIO pin number then fire play_trigger
-                # in a daemon thread — identical behaviour to a physical button press.
-                pin_map = {
-                    "trigger_1": GPIO_PINS[0],
-                    "trigger_2": GPIO_PINS[1],
-                    "trigger_3": GPIO_PINS[2],
-                }
-                pin = pin_map[action]
-                logger.info("UDP trigger command: %s → pin %s", action, pin)
-                threading.Thread(
-                    target=play_trigger, args=(pin, "udp"),
-                    daemon=True, name=f"udp-trigger-{pin}",
-                ).start()
+            run_action(action, "udp")
 
         except Exception:
             logger.exception("UDP listener error")
@@ -5042,11 +5903,85 @@ async function reedTestPrompt(){
   }catch(e){st.textContent='Request failed';st.style.color='var(--err-fg)';}
 }
 
+/* ── Central manager ── */
+const MGR_SLOTS={loop:'Loop',trigger1:'Trigger 1',trigger2:'Trigger 2',trigger3:'Trigger 3',override:'Override',player:'player update'};
+function mgrAgo(s){
+  if(s===null||s===undefined)return '';
+  s=Math.max(0,Math.round(s));
+  if(s<60)return s+' s ago';
+  if(s<3600)return Math.round(s/60)+' min ago';
+  return Math.round(s/3600)+' h ago';
+}
+function mgrShort(server){return (server||'').indexOf('http://')===0?server.slice(7):(server||'');}
+function mgrShow(d){
+  const head=document.getElementById('mgrHead');
+  if(!head)return;
+  const inp=document.getElementById('mgrServer');
+  if(inp&&document.activeElement!==inp&&!inp.dataset.dirty)inp.value=mgrShort(d.server);
+  const leave=document.getElementById('mgrLeaveBtn');
+  if(leave)leave.style.display=d.server?'':'none';
+  let cls='aes-off',txt='Not joined to a central manager.';
+  if(d.server&&d.connected===true){
+    cls='aes-ok';
+    txt='Connected to '+(d.server_name||mgrShort(d.server))+' - last report '+mgrAgo(d.last_ok_ago)+'.';
+  }else if(d.server&&d.connected===false){
+    cls='aes-err';
+    txt='Cannot reach the manager at '+mgrShort(d.server)+': '+d.error+(d.since_ago!==null?' (since '+mgrAgo(d.since_ago)+')':'')+'.';
+  }else if(d.server){
+    cls='aes-warn';txt='Joining '+mgrShort(d.server)+'...';
+  }
+  head.className='aes-head '+cls;head.textContent=txt;
+  const st=document.getElementById('mgrSt');
+  if(!st)return;
+  const parts=['This unit is '+d.unit_id+' on the manager.'];
+  if(d.server&&d.managed&&d.managed.length){
+    parts.push('The manager sets: '+d.managed.map(function(s){return MGR_SLOTS[s]||s;}).join(', ')+'.');
+  }
+  if(d.server&&d.connected===true&&d.remote_controls)parts.push('Remote controls are on.');
+  if(d.player_target)parts.push('The manager is updating this unit to v'+d.player_target+'.');
+  if(d.job){
+    const pct=d.job.size?Math.floor(100*d.job.done/d.job.size):0;
+    parts.push(d.job.slot==='player'?'Fetching the new player version: '+pct+' %.':'Fetching the new '+(MGR_SLOTS[d.job.slot]||d.job.slot)+' clip: '+pct+' %.');
+  }
+  Object.keys(d.failed||{}).forEach(function(s){
+    parts.push((s==='player'?'Player update':(MGR_SLOTS[s]||s)+' clip')+' not fetched: '+d.failed[s].error+' - trying again in '+d.failed[s].retry_in+' s.');
+  });
+  st.textContent=parts.join(' ');
+}
+async function loadMgr(){
+  try{mgrShow(await(await fetch('/manager')).json());}catch(e){}
+}
+async function mgrPost(server){
+  const st=document.getElementById('mgrSt');
+  try{
+    const r=await fetch('/manager',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({server:server})});
+    const d=await r.json();
+    if(!r.ok){if(st){st.textContent=d.message||'Not saved';st.style.color='var(--err-fg)';}return;}
+    if(st)st.style.color='';
+    const inp=document.getElementById('mgrServer');
+    if(inp)delete inp.dataset.dirty;
+    mgrShow(d);
+    toast(server?'✅ Joining the manager':'✅ Left the manager','ok');
+  }catch(e){toast('❌ Request failed','err');}
+}
+function mgrSave(){
+  const inp=document.getElementById('mgrServer');
+  mgrPost(inp?inp.value.trim():'');
+}
+function mgrLeave(){
+  if(!confirm('Leave the central manager? This unit stops reporting to it and keeps the clips it has.'))return;
+  const inp=document.getElementById('mgrServer');
+  if(inp){inp.value='';delete inp.dataset.dirty;}
+  mgrPost('');
+}
+
 window.onload=function(){
   themeLabel();
   foldSetup();
   fetchStatus();fetchVolume();fetchSysInfo();
   fetchSlotStatus();loadAudioDevices();loadDisplayModes();fetchPlayerName();fetchMaxUpload();loadInstalledVersion();loadAes67();loadBt();
+  loadMgr();setInterval(function(){if(!document.hidden)loadMgr();},5000);
 }
 </script>
 <script>
@@ -5340,6 +6275,21 @@ document.documentElement.setAttribute('data-theme',t);})();
     <button class="btn btn-orange btn-sm" id="scriptBtn" onclick="doScriptUpload()">Deploy Script</button>
   </div>
   <div id="scriptSt" style="font-size:0.85em;margin-top:6px;color:var(--muted)"></div>
+</div>
+
+<!-- ── Central manager ── -->
+<div class="card" id="mgrCard" data-fold="manager">
+  <h3>&#128752; Central Manager</h3>
+  <div id="mgrHead" class="aes-head aes-off">&hellip;</div>
+  <div class="row"><label class="lbl" for="mgrServer">Manager address</label>
+    <input type="text" id="mgrServer" maxlength="200" placeholder="the manager's IP address" oninput="this.dataset.dirty='1'"
+      onkeydown="if(event.key==='Enter')mgrSave()" style="flex:1;min-width:160px;max-width:320px">
+    <button class="btn btn-green btn-sm" onclick="mgrSave()">Join</button>
+    <button class="btn btn-grey btn-sm" id="mgrLeaveBtn" onclick="mgrLeave()">Leave</button></div>
+  <p class="audio-hint">The IP address or name of the computer running the SAW manager - port 5080 unless you add
+     another (e.g. :8080 after the address). This unit then reports what it is playing there every 10 seconds, and takes the clips
+     the manager assigns to it. Empty: nothing is sent anywhere.</p>
+  <div id="mgrSt" class="audio-hint"></div>
 </div>
 
 <!-- ── Logs ── -->
@@ -6038,6 +6988,32 @@ def reed_route():
         handset.apply()
     return jsonify({"settings": reed_settings(), "state": handset.status(),
                     "pin": REED_PIN, "triggers": len(GPIO_PINS)})
+
+@app.route("/manager", methods=["GET", "POST"])
+def manager_route():
+    """GET: the manager's address and the link's state. POST {"server": ...}:
+    join (an address) or leave ("")."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        raw = data.get("server", "")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            server = ""
+        else:
+            server = manager_parse_address(raw)
+            if not server:
+                return jsonify({"ok": False, "message":
+                                "That is not an address. Enter the manager's IP address or "
+                                "name - and :8080 after it for a port other than 5080."}), 400
+        m = dict(config.get("manager") or {})
+        old = m.get("server") or ""
+        m["server"] = server
+        config["manager"] = m
+        save_config(dict(config))
+        if server != old:
+            logger.info("Central manager: %s", ("address set to %s" % server) if server
+                        else "left %s - no more reports" % old)
+        manager_client.apply()
+    return jsonify(dict(manager_client.status(), ok=True))
 
 @app.route("/reed/fonts")
 def reed_fonts_route():
@@ -6791,6 +7767,9 @@ if __name__ == "__main__":
 
     # The handset reed switch, if it has been turned on - GPIO 23 untouched otherwise.
     handset.apply()
+
+    # The central manager, if this unit has joined one - no thread otherwise.
+    manager_client.apply()
 
     # An AES67 build with the picture kept up, still running from before this
     # restart: keep the memory free for it, and pin again when it ends.
