@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v21)
+Stage Audio Works Raspberry Pi Video Player  (v22)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -76,6 +76,10 @@ Features:
     Every panel can be folded away; each browser remembers which.
   • The Stage Audio Works logo is built in (v21), black or white to suit the
     theme - no /home/pi/saw.jpg needed.
+  • Handset reed switch (v22, optional, off by default): GPIO 23. Putting the
+    handset back ends a trigger clip; a button pressed while it hangs waits for
+    a pick-up with an on-screen prompt (or plays, or is ignored - a setting);
+    picking it up can start a trigger by itself.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -115,6 +119,11 @@ Display endpoints:
   /resolution    GET  — current output mode + refresh rate mpv reports
   /resolution    POST — force a mode, persist, hot-restart mpv; reverts to
                         "preferred" automatically if mpv will not start on it
+
+Handset endpoints:
+  /reed            GET  — settings and the live state; POST — new settings
+  /reed/fonts      GET  — fonts installed on the unit, for the prompt
+  /reed/test_prompt POST — show the prompt on screen for 5 s
 
 Preview endpoint:
   /preview.jpg    GET  — a frame of what is playing (RAM only; at most one grab
@@ -463,6 +472,28 @@ ALLOWED_EXTENSIONS  = {"mp4"}
 # Passed to lgpio poll worker for manual debounce — minimum quiet time between triggers.
 GPIO_DEBOUNCE_S = 0.5
 
+# ── Handset reed switch (see HANDSET) ─────────────────────────────────────────
+# The hanger's two reed wires: GPIO 23 (physical pin 16) and ground (pin 14).
+# Several handsets: wire their contacts so that "any handset lifted" changes
+# the circuit - in series for contacts closed while hanging, in parallel for
+# contacts closed while lifted. Off unless turned on in the web UI: the pin is
+# not even claimed until then.
+REED_PIN        = 23
+REED_STABLE_S   = 0.5         # the contact must hold still this long to count
+REED_POLL_S     = 0.05
+REED_ON_PRESS   = ("wait", "play", "ignore")
+REED_POSITIONS  = ("top", "center", "bottom")
+REED_DEFAULTS   = {
+    "enabled": False,
+    "closed_when": "hung",     # "hung" (standard, handsets in series) or "lifted"
+    "on_press": "wait",        # button pressed while the handset hangs
+    "wait_s": 10,
+    "pickup_starts": False,
+    "pickup_trigger": 1,
+    "prompt": {"text": "Please pick up the handset", "font": "", "size": 55,
+               "color": "#FFFFFF", "position": "center", "box": True},
+}
+
 # ── UDP ───────────────────────────────────────────────────────────────────────
 UDP_PORT     = 5505
 UDP_COMMANDS = {
@@ -486,7 +517,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 21
+PLAYER_VERSION = 22
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -554,6 +585,7 @@ MANUAL_SECTIONS   = {
     "aes67":      ("sec13",   "13-aes67-network-audio-optional"),
     "bluetooth":  ("sec14",   "14-bluetooth-audio"),
     "preview":    ("sec4.13", "413-preview-and-folding-panels"),
+    "handset":    ("sec5.1",  "51-handsets-with-a-reed-switch"),
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -574,6 +606,7 @@ class PlayerState:
     current_video:         str           = field(default_factory=lambda: os.path.basename(LOOP_VIDEO))
     current_trigger_video: Optional[str] = None
     trigger_running:       bool          = False
+    trigger_stop:          bool          = False   # the handset went back: end the clip
     restart_in_progress:   bool          = False
     paused:                bool          = False
     volume:                int           = DEFAULT_VOLUME
@@ -2951,6 +2984,8 @@ def wait_for_playback_end(
             if state.override_active:
                 logger.info("wait_for_playback_end: override activated — exiting early")
                 return False
+            if state.trigger_stop:
+                return True          # the handset went back: the caller resumes the loop
 
         st = get_mpv_status()
 
@@ -2979,7 +3014,12 @@ def wait_for_playback_end(
 # Debounce is handled manually with a per-pin timestamp.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def play_trigger(pin: int):
+def play_trigger(pin: int, source: str = "button"):
+    """
+    Play a trigger clip, then go back to the loop. `source`: "button" (a GPIO
+    button - the only source the handset rules apply to), "udp" (show control,
+    deliberate, never held up), or "handset" (a pick-up, already decided).
+    """
     logger.info("Trigger: pin %s", pin)
     with state_lock:
         if state.override_active:
@@ -2992,7 +3032,14 @@ def play_trigger(pin: int):
         if state.restart_in_progress:
             logger.info("Trigger pin %s ignored — restart in progress", pin)
             return
+    if source == "button" and not handset.allow_press(pin):
+        return
+    with state_lock:
+        if state.override_active or state.trigger_running or state.restart_in_progress:
+            logger.info("Trigger pin %s ignored — the player changed state meanwhile", pin)
+            return
         state.trigger_running       = True
+        state.trigger_stop          = False
         video_path                  = TRIGGER_VIDEOS.get(pin)
         state.current_trigger_video = os.path.basename(video_path) if video_path else None
         state.paused                = False
@@ -3009,6 +3056,7 @@ def play_trigger(pin: int):
     finally:
         with state_lock:
             state.trigger_running       = False
+            state.trigger_stop          = False
             state.current_trigger_video = None
             state.paused                = False
             override_interrupted        = state.override_active
@@ -3072,6 +3120,271 @@ if _gpio_init():
             target=_gpio_trigger_worker, args=(_pin,),
             daemon=True, name=f"gpio-{_pin}",
         ).start()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HANDSET  (reed switch in the hanger - optional, off by default)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Handsets such as Molitor's hang on a magnetic hanger with a reed switch: two
+# wires that tell the player whether a handset is on its hanger. With it on:
+#
+#   * The handset goes back while a trigger clip plays: back to the loop.
+#   * A BUTTON is pressed while the handset hangs - the site chooses:
+#       wait   (default) the loop carries on, "Please pick up the handset" is
+#              shown, and the clip starts if it is picked up within wait_s;
+#       play   the clip plays anyway;
+#       ignore the press does nothing (signage tells visitors to lift first).
+#   * Optionally, picking the handset up starts a chosen trigger by itself.
+#
+# Events come from CHANGES - picked up, put back - each held for REED_STABLE_S
+# before it counts, so a knock or a bouncing contact does nothing. The first
+# reading after it is turned on sets the state without firing anything. UDP
+# triggers (show control) are not held up; override ignores the handset as it
+# does the buttons. Off (the default), GPIO 23 is never claimed: a unit with
+# nothing wired there cannot be affected.
+#
+# The prompt is mpv's on-screen text, styled through its osd-* properties at
+# the moment it is shown - mpv's command line is unchanged.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+def _reed_int(value, default: int, lo: int, hi: int) -> int:
+    """An int setting within [lo, hi], or the default."""
+    n = _as_int(value)
+    return default if n is None else max(lo, min(hi, n))
+
+def reed_clean_settings(raw) -> dict:
+    """The handset settings, every field checked and defaulted."""
+    raw = raw if isinstance(raw, dict) else {}
+    d = REED_DEFAULTS
+    out = {
+        "enabled": raw.get("enabled") is True,
+        "closed_when": raw.get("closed_when") if raw.get("closed_when") in ("hung", "lifted") else d["closed_when"],
+        "on_press": raw.get("on_press") if raw.get("on_press") in REED_ON_PRESS else d["on_press"],
+        "wait_s": _reed_int(raw.get("wait_s"), d["wait_s"], 3, 60),
+        "pickup_starts": raw.get("pickup_starts") is True,
+        "pickup_trigger": _reed_int(raw.get("pickup_trigger"), d["pickup_trigger"], 1, len(GPIO_PINS)),
+    }
+    rp = raw.get("prompt") if isinstance(raw.get("prompt"), dict) else {}
+    dp = d["prompt"]
+    text = rp.get("text") if isinstance(rp.get("text"), str) else dp["text"]
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text).strip()[:120] or dp["text"]
+    font = rp.get("font") if isinstance(rp.get("font"), str) else ""
+    font = re.sub(r"[^A-Za-z0-9 _.-]", "", font).strip()[:60]
+    out["prompt"] = {
+        "text": text,
+        "font": font,
+        "size": _reed_int(rp.get("size"), dp["size"], 20, 150),
+        "color": rp.get("color").upper() if isinstance(rp.get("color"), str) and _HEX_COLOR_RE.match(rp.get("color")) else dp["color"],
+        "position": rp.get("position") if rp.get("position") in REED_POSITIONS else dp["position"],
+        "box": rp.get("box") is not False,
+    }
+    return out
+
+def reed_settings() -> dict:
+    return reed_clean_settings(config.get("reed"))
+
+def reed_is_lifted(contact_closed: bool, closed_when: str) -> bool:
+    """Whether a handset is lifted, from the contact and how it is wired."""
+    return contact_closed if closed_when == "lifted" else not contact_closed
+
+def osd_escape(text: str) -> str:
+    """Text for mpv's show-text, shown as typed: "$" starts a property
+    expansion there, "$$" is a plain dollar."""
+    return text.replace("$", "$$")
+
+def osd_show_prompt(prompt: dict, seconds: float):
+    """The prompt on screen for `seconds`, styled first - mpv forgets OSD
+    settings when it restarts, so they are set every time."""
+    fill = prompt["color"]
+    for prop, val in (("osd-font", prompt["font"] or "sans-serif"),
+                      ("osd-font-size", prompt["size"]),
+                      ("osd-color", fill),
+                      ("osd-border-color", "#000000"),
+                      ("osd-border-size", 3),
+                      ("osd-align-x", "center"),
+                      ("osd-align-y", prompt["position"]),
+                      ("osd-margin-y", 40),
+                      ("osd-border-style", "background-box" if prompt["box"] else "outline-and-shadow"),
+                      ("osd-back-color", "#99000000" if prompt["box"] else "#00000000")):
+        _mpv_send(["set_property", prop, val])     # osd-border-style is new in mpv 0.37: older ones say no, harmlessly
+    _mpv_send(["show-text", osd_escape(prompt["text"]), int(seconds * 1000)])
+
+def osd_clear():
+    _mpv_send(["show-text", "", 1])
+
+class Handset:
+    """
+    The handset on GPIO 23, while turned on: its debounced state, a press
+    waiting for a pick-up, and the events. step() is the logic, apart from
+    the GPIO so the tests drive it on a fake clock.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self.lifted = None            # debounced: True, False, or None (not read yet)
+        self.closed = None            # the raw contact, last read
+        self._cand = None             # a reading not yet held REED_STABLE_S
+        self._cand_since = 0.0
+        self.pending = None           # (pin, until): a press waiting for a pick-up
+        self.claimed = False
+        self.error = ""
+        self._thread = None
+
+    # -- the logic ----------------------------------------------------------------
+    def step(self, contact_closed: bool, now: float, settings: dict):
+        """One reading. Returns "lifted", "hung" or None (no change)."""
+        lifted = reed_is_lifted(contact_closed, settings["closed_when"])
+        with self._lock:
+            self.closed = contact_closed
+            if lifted == self.lifted:
+                self._cand = None
+                return None
+            if self._cand != lifted:
+                self._cand, self._cand_since = lifted, now
+                return None
+            if now - self._cand_since < REED_STABLE_S:
+                return None
+            first = self.lifted is None
+            self.lifted, self._cand = lifted, None
+        if first:
+            return None               # the first reading sets the state, fires nothing
+        return "lifted" if lifted else "hung"
+
+    def on_event(self, event: str, settings: dict):
+        if event == "lifted":
+            logger.info("Handset picked up")
+            with self._lock:
+                pend, self.pending = self.pending, None
+            if pend is not None and self._clock() <= pend[1]:
+                osd_clear()
+                self._start(pend[0])
+            elif settings["pickup_starts"]:
+                with state_lock:
+                    busy = state.trigger_running or state.override_active or state.restart_in_progress
+                if not busy:
+                    self._start(GPIO_PINS[settings["pickup_trigger"] - 1])
+        elif event == "hung":
+            logger.info("Handset put back")
+            with self._lock:
+                had_pending, self.pending = self.pending is not None, None
+            if had_pending:
+                osd_clear()
+            with state_lock:
+                stop = state.trigger_running and not state.override_active
+                if stop:
+                    state.trigger_stop = True
+            if stop:
+                logger.info("Handset put back while a clip played - back to the loop")
+
+    def _start(self, pin: int):
+        threading.Thread(target=play_trigger, args=(pin, "handset"), daemon=True,
+                         name="handset-trigger-%d" % pin).start()
+
+    def allow_press(self, pin: int) -> bool:
+        """A button press, before its clip starts: whether to play it now."""
+        st = reed_settings()
+        with self._lock:
+            hung = st["enabled"] and self.lifted is False
+        if not hung:
+            return True               # off, lifted, or not read yet: as before
+        if st["on_press"] == "play":
+            return True
+        if st["on_press"] == "ignore":
+            logger.info("Trigger pin %s ignored — the handset is on its hanger", pin)
+            return False
+        with self._lock:
+            self.pending = (pin, self._clock() + st["wait_s"])
+        logger.info("Trigger pin %s: waiting up to %d s for the handset to be picked up", pin, st["wait_s"])
+        osd_show_prompt(st["prompt"], st["wait_s"])
+        return False
+
+    def expire(self, now: float):
+        """A press nobody followed with a pick-up: dropped."""
+        with self._lock:
+            pend = self.pending
+            if pend is None or now <= pend[1]:
+                return
+            self.pending = None
+        logger.info("Trigger pin %s dropped — the handset was not picked up", pend[0])
+
+    # -- the GPIO side ---------------------------------------------------------------
+    def apply(self):
+        """Claim or free GPIO 23 to match the setting; start the thread."""
+        st = reed_settings()
+        if st["enabled"] and not self.claimed:
+            if not _LGPIO_AVAILABLE or _gpio_handle is None:
+                self.error = "GPIO is not available on this unit"
+                return
+            try:
+                _lgpio.gpio_claim_input(_gpio_handle, REED_PIN, _lgpio.SET_PULL_UP)
+                self.claimed, self.error = True, ""
+                logger.info("Handset reed switch on (GPIO %d)", REED_PIN)
+            except Exception as e:
+                self.error = "could not claim GPIO %d (%s)" % (REED_PIN, e)
+                logger.warning("Handset: %s", self.error)
+                return
+        elif not st["enabled"] and self.claimed:
+            try:
+                _lgpio.gpio_free(_gpio_handle, REED_PIN)
+            except Exception:
+                pass
+            self.claimed = False
+            with self._lock:
+                self.lifted = self.closed = self._cand = self.pending = None
+            logger.info("Handset reed switch off (GPIO %d released)", REED_PIN)
+        if self.claimed and self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="handset")
+            self._thread.start()
+
+    def _run(self):
+        last_exc = ""
+        while True:
+            try:
+                if self.claimed:
+                    st = reed_settings()
+                    closed = _lgpio.gpio_read(_gpio_handle, REED_PIN) == 0   # to ground = closed
+                    now = self._clock()
+                    event = self.step(closed, now, st)
+                    if event:
+                        self.on_event(event, st)
+                    self.expire(now)
+                last_exc = ""
+            except Exception as e:
+                if repr(e) != last_exc:
+                    logger.exception("Handset error")
+                    last_exc = repr(e)
+            time.sleep(REED_POLL_S if self.claimed else 0.5)
+
+    def status(self) -> dict:
+        with self._lock:
+            pend = self.pending
+            return {"claimed": self.claimed, "error": self.error, "closed": self.closed,
+                    "lifted": self.lifted,
+                    "waiting_s": max(0, int(pend[1] - self._clock())) if pend else 0,
+                    "waiting_pin": pend[0] if pend else None}
+
+handset = Handset()
+
+_fonts_cache = None
+
+def osd_fonts() -> list:
+    """Font families installed on this unit, for the prompt's font list."""
+    global _fonts_cache
+    if _fonts_cache is None:
+        fams = set()
+        try:
+            out = subprocess.run(["fc-list", ":", "family"], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                name = line.split(",")[0].strip()
+                if name and re.fullmatch(r"[A-Za-z0-9 _.-]{1,60}", name):
+                    fams.add(name)
+        except Exception:
+            pass
+        _fonts_cache = sorted(fams)[:80]
+    return _fonts_cache
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UDP LISTENER
@@ -3151,7 +3464,7 @@ def udp_listener():
                 pin = pin_map[action]
                 logger.info("UDP trigger command: %s → pin %s", action, pin)
                 threading.Thread(
-                    target=play_trigger, args=(pin,),
+                    target=play_trigger, args=(pin, "udp"),
                     daemon=True, name=f"udp-trigger-{pin}",
                 ).start()
 
@@ -4595,6 +4908,7 @@ function foldCard(card,folded){
   const m=card.querySelector('.fold-mark');
   if(m)m.textContent=folded?String.fromCharCode(9656):String.fromCharCode(9662);
   if(card.id==='pvCard')previewRun(!folded);
+  if(card.id==='reedCard')reedRun(!folded);
 }
 function foldSetup(){
   try{foldState=JSON.parse(localStorage.getItem('sawFolded')||'{}')||{};}catch(e){foldState={};}
@@ -4655,6 +4969,78 @@ async function previewFetch(){
   if(pvOn&&!document.hidden)pvTimer=setTimeout(previewFetch,10000);
 }
 document.addEventListener('visibilitychange',()=>{if(pvOn&&!document.hidden&&!pvTimer)previewFetch();});
+
+/* -- Handset (reed switch) --
+   The live state every 2 s while the panel is open. The form is filled once,
+   so typing is never overwritten by a refresh. */
+let reedTimer=null,reedFilled=false;
+function reedRun(on){
+  if(reedTimer){clearInterval(reedTimer);reedTimer=null;}
+  if(on){loadReed();reedTimer=setInterval(loadReed,2000);}
+}
+async function loadReed(){
+  try{
+    const d=await(await fetch('/reed')).json();
+    const s=d.settings,st=d.state,h=document.getElementById('reedHead');
+    if(!s.enabled){h.textContent='Off '+String.fromCharCode(8212)+' GPIO '+d.pin+' is not in use.';h.className='aes-head aes-off';}
+    else if(st.error){h.textContent='Not working: '+st.error;h.className='aes-head aes-err';}
+    else if(st.lifted===null){h.textContent='Reading the handset'+String.fromCharCode(8230);h.className='aes-head aes-warn';}
+    else{
+      h.textContent='Handset: '+(st.lifted?'picked up':'on its hanger')+' (contact '+(st.closed?'closed':'open')+')'+
+        (st.waiting_s?(' '+String.fromCharCode(8212)+' waiting '+st.waiting_s+' s for a pick-up'):'');
+      h.className='aes-head '+(st.lifted?'aes-ok':'aes-off');
+    }
+    if(!reedFilled){
+      reedFilled=true;
+      document.getElementById('reedOn').checked=s.enabled;
+      document.getElementById('reedClosed').value=s.closed_when;
+      document.getElementById('reedPress').value=s.on_press;
+      document.getElementById('reedWait').value=s.wait_s;
+      document.getElementById('reedPick').checked=s.pickup_starts;
+      document.getElementById('reedPickTrig').value=String(s.pickup_trigger);
+      const p=s.prompt;
+      document.getElementById('reedText').value=p.text;
+      document.getElementById('reedSize').value=p.size;
+      document.getElementById('reedColor').value=p.color.toLowerCase();
+      document.getElementById('reedPos').value=p.position;
+      document.getElementById('reedBox').checked=p.box;
+      const f=await(await fetch('/reed/fonts')).json();
+      const sel=document.getElementById('reedFont');
+      (f.fonts||[]).forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;sel.appendChild(o);});
+      sel.value=p.font||'';
+    }
+  }catch(e){}
+}
+function reedForm(){
+  return {enabled:document.getElementById('reedOn').checked,
+    closed_when:document.getElementById('reedClosed').value,
+    on_press:document.getElementById('reedPress').value,
+    wait_s:parseInt(document.getElementById('reedWait').value,10),
+    pickup_starts:document.getElementById('reedPick').checked,
+    pickup_trigger:parseInt(document.getElementById('reedPickTrig').value,10),
+    prompt:{text:document.getElementById('reedText').value,
+      font:document.getElementById('reedFont').value,
+      size:parseInt(document.getElementById('reedSize').value,10),
+      color:document.getElementById('reedColor').value,
+      position:document.getElementById('reedPos').value,
+      box:document.getElementById('reedBox').checked}};
+}
+async function reedSave(){
+  const st=document.getElementById('reedSt');
+  try{
+    const r=await fetch('/reed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(reedForm())});
+    st.textContent=r.ok?'Saved.':'Not saved.';st.style.color=r.ok?'var(--ok-fg)':'var(--err-fg)';
+    loadReed();
+  }catch(e){st.textContent='Request failed';st.style.color='var(--err-fg)';}
+}
+async function reedTestPrompt(){
+  const st=document.getElementById('reedSt');
+  try{
+    const r=await fetch('/reed/test_prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:reedForm().prompt})});
+    const d=await r.json();
+    st.textContent=d.ok?'On the screen for 5 seconds.':('Not shown: '+d.message);st.style.color=d.ok?'':'var(--err-fg)';
+  }catch(e){st.textContent='Request failed';st.style.color='var(--err-fg)';}
+}
 
 window.onload=function(){
   themeLabel();
@@ -4888,6 +5274,40 @@ document.documentElement.setAttribute('data-theme',t);})();
       <strong>Activate Override</strong>
     </label>
   </div>
+</div>
+
+<!-- ── Handset (reed switch) ── -->
+<div class="card" id="reedCard" data-fold="handset" data-fold-default="folded">
+  <h3>&#128222; Handset (reed switch)<a class="help" href="/manual?section=handset" target="_blank" rel="noopener">? Help</a></h3>
+  <div id="reedHead" class="aes-head aes-off">&hellip;</div>
+  <p class="audio-hint">Wiring: the hanger's two reed wires to <b>GPIO 23 (pin 16)</b> and <b>ground (pin 14)</b>.
+     Several handsets: contacts that close while hanging go in series; contacts that close while lifted go in parallel.</p>
+  <label><input type="checkbox" id="reedOn"> Use the handset reed switch</label>
+  <div id="reedOpts">
+    <div class="row" style="margin-top:8px"><label class="lbl" for="reedClosed">The contact is closed when</label>
+      <select id="reedClosed"><option value="hung">the handset hangs (standard; handsets in series)</option>
+      <option value="lifted">the handset is lifted (e.g. Molitor DIO)</option></select></div>
+    <div class="row"><label class="lbl" for="reedPress">A button pressed while the handset hangs</label>
+      <select id="reedPress"><option value="wait">waits for the handset to be picked up</option>
+      <option value="play">plays anyway</option><option value="ignore">does nothing</option></select></div>
+    <div class="row"><label class="lbl" for="reedWait">Wait for pick-up</label>
+      <input type="number" id="reedWait" min="3" max="60" style="width:70px"> seconds</div>
+    <div class="row"><label><input type="checkbox" id="reedPick"> Picking up the handset starts</label>
+      <select id="reedPickTrig"><option value="1">Trigger 1</option><option value="2">Trigger 2</option><option value="3">Trigger 3</option></select></div>
+    <div class="bt-sub">The pick-up prompt</div>
+    <div class="row"><label class="lbl" for="reedText">Text</label><input type="text" id="reedText" maxlength="120" style="flex:1;min-width:180px"></div>
+    <div class="row"><label class="lbl" for="reedFont">Font</label><select id="reedFont"><option value="">Default</option></select>
+      <label for="reedSize" style="margin-left:8px">Size</label><input type="number" id="reedSize" min="20" max="150" style="width:70px">
+      <label for="reedColor" style="margin-left:8px">Colour</label><input type="color" id="reedColor"></div>
+    <div class="row"><label class="lbl" for="reedPos">Position</label>
+      <select id="reedPos"><option value="top">top</option><option value="center">centre</option><option value="bottom">bottom</option></select>
+      <label style="margin-left:8px"><input type="checkbox" id="reedBox"> dark box behind the text</label></div>
+  </div>
+  <div style="margin-top:8px">
+    <button class="btn btn-green btn-sm" onclick="reedSave()">Save</button>
+    <button class="btn btn-grey btn-sm" onclick="reedTestPrompt()" style="margin-left:6px">Show prompt now</button>
+  </div>
+  <div id="reedSt" class="audio-hint"></div>
 </div>
 
 <!-- ── Software update ── -->
@@ -5600,6 +6020,38 @@ def preview_grab(now: Optional[float] = None) -> Tuple[bool, str]:
         os.replace(tmp, PREVIEW_FILE)
         _preview_taken = now
         return True, ""
+
+@app.route("/reed", methods=["GET", "POST"])
+def reed_route():
+    """GET: the handset settings and its live state. POST: new settings
+    (any fields; the rest kept), saved and applied at once."""
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        merged = dict(reed_settings())
+        for k, v in data.items():
+            if k == "prompt" and isinstance(v, dict):
+                merged["prompt"] = dict(merged["prompt"], **v)
+            elif k in REED_DEFAULTS:
+                merged[k] = v
+        config["reed"] = reed_clean_settings(merged)
+        save_config(dict(config))
+        handset.apply()
+    return jsonify({"settings": reed_settings(), "state": handset.status(),
+                    "pin": REED_PIN, "triggers": len(GPIO_PINS)})
+
+@app.route("/reed/fonts")
+def reed_fonts_route():
+    return jsonify({"fonts": osd_fonts()})
+
+@app.route("/reed/test_prompt", methods=["POST"])
+def reed_test_prompt():
+    """Show the prompt on the screen for 5 s - with the panel's unsaved style."""
+    data = request.get_json(silent=True) or {}
+    st = reed_clean_settings(dict(reed_settings(), prompt=dict(reed_settings()["prompt"], **(data.get("prompt") or {}))))
+    if not _mpv_is_running():
+        return jsonify({"ok": False, "message": "the video is not playing"}), 503
+    osd_show_prompt(st["prompt"], 5)
+    return jsonify({"ok": True})
 
 @app.route("/preview.jpg")
 def preview_jpg():
@@ -6336,6 +6788,9 @@ if __name__ == "__main__":
     # Bluetooth: reconnect the speaker that is the audio output, and run what
     # the web UI asks for. Touches nothing on a unit where it was never turned on.
     bt_manager.start()
+
+    # The handset reed switch, if it has been turned on - GPIO 23 untouched otherwise.
+    handset.apply()
 
     # An AES67 build with the picture kept up, still running from before this
     # restart: keep the memory free for it, and pin again when it ends.

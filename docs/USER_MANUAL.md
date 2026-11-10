@@ -1,7 +1,7 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v21**. Features that arrived in a recent version
+**Applies to:** software version **v22**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
 **Last updated:** 2026-10-26
 
@@ -437,6 +437,57 @@ then the attractor loop resumes automatically.
 
 The log records every press and, when ignored, the reason.
 
+### 5.1 Handsets with a reed switch
+
+For exhibits with listening handsets on a magnetic hanger — such as Molitor's — the
+hanger's reed switch tells the player whether the handset is in use (v22). It is
+**off unless turned on**, in the **Handset (reed switch)** panel; while off, the
+player does not touch its GPIO pin at all, so units without a handset are unaffected.
+
+**Wiring.** The hanger's two reed wires, either way round:
+
+| Hanger wire | Pi pin |
+|---|---|
+| Reed wire 1 | **GPIO 23 — physical pin 16** |
+| Reed wire 2 | **Ground — physical pin 14** (or 20) |
+
+No other parts are needed. On a cable run of more than a couple of metres in a busy
+building, a 4.7–10 kΩ resistor from pin 16 to 3.3 V (pin 17) stops interference being
+read as a handset moving.
+
+**Several handsets** share the one input. Wire their contacts so that lifting any one
+changes the circuit: contacts that are **closed while the handset hangs** (the
+standard kind) go in **series**; contacts that are **closed while it is lifted** (such
+as Molitor's DIO, which is "inverted") go in **parallel**. The player then sees "a
+handset is lifted" or "all are back" — a clip ends only when the last handset is put
+back.
+
+**Setting up.** Turn it on, then lift and replace a handset while watching the
+panel's live readout. If it says *picked up* when the handset hangs, change **The
+contact is closed when** to the other choice.
+
+**What it does:**
+
+- **Putting the handset back** while a trigger clip plays ends the clip and returns
+  to the loop.
+- **A button pressed while the handset hangs** — choose one:
+  - **waits for the handset to be picked up** (default): the loop carries on with a
+    prompt on screen, *"Please pick up the handset"*; if it is picked up within the
+    wait (10 seconds unless changed), the clip starts; if not, the press is dropped.
+  - **plays anyway**;
+  - **does nothing** — then signage should tell visitors to lift the handset first.
+- **Picking up the handset starts a clip** — optional, off unless ticked: lifting it
+  plays the chosen trigger, as Molitor's own players do.
+- Movements shorter than half a second are ignored, so a knock on the hanger does
+  nothing. Override mode ignores the handset, as it does the buttons. Triggers sent
+  over the network (UDP) are never held back by the handset.
+
+**The prompt** — its text, font (any font installed on the unit), size, colour,
+position and a dark box behind it — is set in the same panel. **Show prompt now**
+puts it on the screen for 5 seconds with the panel's settings, saved or not, to try
+them out. It is drawn by the player itself over the video; it does not appear in
+the web interface's Preview.
+
 ---
 
 ## 6. Installing a new unit
@@ -623,6 +674,8 @@ All endpoints are served on port 5000. No authentication.
 | `GET`  | `/update/version` | The installed version |
 | `GET`  | `/update/check` | Compare with the published release on GitHub |
 | `POST` | `/update/apply` | Download, verify and install a newer release |
+| `GET`/`POST` | `/reed` | The handset settings and its live state; post any settings to change them (v22) |
+| `POST` | `/reed/test_prompt` | Show the pick-up prompt on screen for 5 seconds |
 | `GET`  | `/preview.jpg` | A frame of what is playing (v20), kept in RAM; at most one new frame every 5 seconds. Header `X-Taken`: when it was taken. `503` with a reason when there is nothing to show. |
 | `GET`  | `/manual` | This manual: the copy on the unit, else GitHub's. `?section=aes67` (also `system`, `audio`, `resolution`, `videos`, `update`, `bluetooth`) opens that section; `?online=1` always opens GitHub's |
 | `GET`  | `/logs/tail` | Recent log lines |
@@ -1127,5 +1180,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v21.*
+*Stage Audio Works — Raspberry Pi Video Player, v22.*
 *This software is provided with no warranty and no support. See `README.md`.*
