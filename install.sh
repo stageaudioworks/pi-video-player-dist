@@ -458,6 +458,17 @@ else
     warn "AES67 files not found next to install.sh - installing AES67 from the web UI will not be offered"
 fi
 
+# Where AES67 is installed: bring its daemon back after a crash. Units that
+# installed AES67 before this existed had no restart rule, and a crash on a PTP
+# grandmaster change left one off the network for a week. Only writes a drop-in
+# and reloads systemd - never restarts the daemon, never installs AES67 (it does
+# nothing on a unit without it). The function lives in install-aes67.sh;
+# sourcing it in a subshell runs nothing else.
+if [[ -f "${SCRIPT_DIR}/install-aes67.sh" ]]; then
+    ( . "${SCRIPT_DIR}/install-aes67.sh" && install_daemon_restart ) \
+        || warn "could not set the AES67 daemon's restart rule"
+fi
+
 info "Starting ${SERVICE_NAME} service..."
 systemctl start "${SERVICE_NAME}" \
     || warn "Service failed to start — check: journalctl -u ${SERVICE_NAME} -n 50"

@@ -968,6 +968,20 @@ different one takes over, the panel shows an alert until dismissed: receivers se
 by hand from the SDP must import it again. Q-SYS in Auto mode picks it up from the
 announcement.
 
+**One master only.** Other PTP devices on the network — wireless microphone
+receivers, conferencing systems — may be able to become the master as well. Then a
+Core restart or design deploy hands the clock to one of them and back again a few
+seconds later, and every AES67 device on the network has to follow both changes.
+Set the other devices to follow only (often called *slave only* or *follower*),
+or at least give the Core the lower `priority1` (for example 100, against their
+128 or higher), so it always wins.
+
+**If the daemon stops.** The AES67 daemon has been seen to crash when the
+grandmaster changes. The installer sets it to restart by itself within seconds,
+and the panel's restart alert then appears. A unit that installed AES67 before
+2026-11-11 gets that setting from the one-line installer (section 6.1), which
+restarts nothing.
+
 ### 13.5 Lip-sync
 
 Audio sent over the network arrives later than it would through HDMI: the bridge
@@ -1026,6 +1040,7 @@ cat /proc/asound/RAVENNA/pcm0p/sub0/status                    # RUNNING, with hw
 | Symptom | Check in this order |
 |---|---|
 | **"On air" but the receiver hears nothing** | The receiver's Details say `connected=0` → rename the stream (13.4, "A receiver that shows the stream but plays nothing") → IGMP querier on the switches → receiver set to the right group and port → PTP domain → try **Manual** mode with the details from 13.4 |
+| **"The AES67 daemon is not answering"** | `sudo systemctl restart aes67-daemon`, then run the one-line installer (section 6.1) so it restarts by itself next time (13.4, "If the daemon stops"). `journalctl -u aes67-daemon -n 20` shows how it stopped. |
 | **The panel says the daemon restarted** | A receiver may need the stream renamed (13.4). Then dismiss the alert. `journalctl -u aes67-daemon -b` says why it restarted. |
 | **Stream not listed in Q-SYS Auto mode** | Announcements are multicast: same VLAN, and the switch passes 239.255.255.255 |
 | **Receiver reports a grandmaster mismatch** | The receiver's SDP is older than a grandmaster change — import it again |

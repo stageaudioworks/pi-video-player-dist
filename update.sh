@@ -141,6 +141,14 @@ SUDOEOF
         info "  ✅  removed"
     fi
 
+    # ── AES67: bring the daemon back after a crash ────────────────────────────
+    # As install.sh: a drop-in and a daemon-reload, only where AES67 is
+    # installed, never a daemon restart. Needs install-aes67.sh copied across.
+    if [[ -f "${SCRIPT_DIR}/install-aes67.sh" ]]; then
+        ( . "${SCRIPT_DIR}/install-aes67.sh" && install_daemon_restart ) \
+            || warn "could not set the AES67 daemon's restart rule"
+    fi
+
     # ── The user manual, for the web UI's "User manual" and Help links ────────
     # Read by the player on each request, so no restart. Found in docs/ (a
     # checkout) or next to this script (files copied across flat).

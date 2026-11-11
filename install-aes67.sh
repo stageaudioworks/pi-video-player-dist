@@ -421,6 +421,60 @@ WantedBy=multi-user.target
 EOF
 }
 
+# The daemon crashes now and then when the PTP grandmaster changes: at a site on
+# 2026-11-03 the master went Q-SYS Core -> a Sennheiser device -> back within
+# 11 s and the daemon died (SEGV) a second later. Its unit had no Restart=, so
+# the stream stayed off the network for a week. systemd brings it back now -
+# after a crash or the watchdog, never after a stop. A drop-in rather than the
+# unit, so a healthy install gets it with no rebuild and no daemon restart
+# (is_current): daemon-reload changes the policy of the running daemon in place.
+# A daemon that can never start (its module gone after a kernel update) must not
+# fill the journal (constraint 21): systemd 254+ backs off from 5 s to 2 min;
+# older systemd has no back-off, so it waits a flat minute. Back-off counts
+# every automatic restart since the last start by hand or boot, hence a cap
+# short enough for a crash in the middle of a show.
+write_daemon_restart_dropin() {   # write_daemon_restart_dropin FILE [SYSTEMD_VERSION]
+    local v="${2-}"
+    [ -n "$v" ] || v="$(systemctl --version 2>/dev/null | awk 'NR == 1 {print $2}')"
+    case "$v" in ''|*[!0-9]*) v=0 ;; esac
+    {
+        echo "# Written by install-aes67.sh: bring the daemon back after a crash."
+        echo "[Service]"
+        echo "Restart=on-failure"
+        if [ "$v" -ge 254 ]; then
+            echo "RestartSec=5"
+            echo "RestartSteps=5"
+            echo "RestartMaxDelaySec=120"
+        else
+            echo "RestartSec=60"
+        fi
+    } > "$1"
+}
+
+# Only where the daemon is installed; only when the file would change. Called by
+# install.sh and update.sh too (sourcing this file), so the one-liner fixes a
+# unit that installed AES67 before this existed. Never restarts the daemon.
+install_daemon_restart() {
+    local unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    local dir="$unit_dir/$DAEMON_SERVICE.service.d" new
+    [ -f "$unit_dir/$DAEMON_SERVICE.service" ] || return 0
+    new="$(mktemp)" || return 1
+    write_daemon_restart_dropin "$new"
+    if cmp -s "$new" "$dir/saw-restart.conf"; then
+        rm -f "$new"
+        return 0
+    fi
+    if install -d -m 755 "$dir" && install -m 644 "$new" "$dir/saw-restart.conf"; then
+        rm -f "$new"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        info "AES67 daemon: restarts by itself after a crash"
+    else
+        rm -f "$new"
+        warn "could not write $dir/saw-restart.conf - the daemon will not restart after a crash"
+        return 1
+    fi
+}
+
 # Per-box AES67 state for cloned SD cards; runs before the daemon at every
 # boot. SAW_CONF, SAW_STATUS, SAW_IDENTITY and SYSFS_NET are test hooks.
 write_identity_script() {   # write_identity_script FILE
@@ -891,6 +945,7 @@ ReadWritePaths=$STATUS_FILE
 WantedBy=multi-user.target
 EOF
 
+    install_daemon_restart
     install_identity
     [ "$SET_GOVERNOR" -eq 1 ] && install_governor
     [ "$FIREWALL" -eq 1 ] && install_firewall
@@ -1074,6 +1129,8 @@ uninstall() {
         systemctl disable --now "$u.service" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$u.service"
     done
+    rm -f "/etc/systemd/system/$DAEMON_SERVICE.service.d/saw-restart.conf"
+    rmdir "/etc/systemd/system/$DAEMON_SERVICE.service.d" 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || true
     rm -f /etc/modules-load.d/saw-aes67.conf /etc/modprobe.d/saw-aes67.conf \
           /etc/sysctl.d/90-aes67.conf /etc/udev/rules.d/90-saw-aes67-sound.rules \
@@ -1104,6 +1161,7 @@ main() {
         info "--force-rebuild to rebuild anyway."
         local p; p="$(sed -n 's/^HTTP_PORT=//p' "$STATE_FILE" 2>/dev/null)"
         case "$p" in ''|*[!0-9]*) ;; *) HTTP_PORT="$p" ;; esac
+        install_daemon_restart
         install_bridge
         exit 0
     fi
