@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v24)
+Stage Audio Works Raspberry Pi Video Player  (v25)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -86,8 +86,9 @@ Features:
     every 10 s, takes the clips the manager assigns to its slots - pulled by
     the unit, resumed if cut, checked against their SHA-256, swapped in like
     an upload - runs its remote controls (the UDP commands, and volume), and
-    installs a newer player version it names. No address: no thread, no
-    network traffic.
+    installs a newer player version it names - and, from v25, the user manual
+    published with that version, so units without internet get it too. No
+    address: no thread, no network traffic.
   • Web UI — video upload/download/delete, volume, override toggle, log viewer,
     system info, reboot, player name, and in-place script update
   • UDP remote commands
@@ -531,7 +532,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 24
+PLAYER_VERSION = 25
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -3488,6 +3489,9 @@ def osd_fonts() -> list:
 # checked, and swapped in with os.replace: the upload route's path, RAM pin
 # included. The reply may also name a player version: installed through
 # _deploy_script() if it is newer than this one, never while a trigger plays.
+# And (v25) the user manual published with that version: fetched from
+# <manager>/api/v1/manual/<sha256>, checked, swapped into MANUAL_PDFS[0] - for
+# that version or a newer one only, before the player update, never holding it up.
 # Remote controls (MANAGER_ACTIONS: UDP's actions plus volume, through
 # run_action()) arrive on a request the manager holds open, /api/v1/wait, so
 # they act within a second; the manager is the separate pi-video-player-server.
@@ -3682,6 +3686,20 @@ def manager_clean_player(raw) -> Optional[dict]:
             and isinstance(sha, str) and _SHA256_RE.match(sha)
             and isinstance(size, int) and not isinstance(size, bool)
             and 0 < size <= UPDATE_MAX_SCRIPT):
+        return {"version": v, "sha256": sha, "size": size}
+    return None
+
+
+def manager_clean_manual(raw) -> Optional[dict]:
+    """The user manual the manager offers (v25): the one published with the
+    player version it wants here -> {"sha256", "size", "version"}, or None."""
+    if not isinstance(raw, dict):
+        return None
+    v, sha, size = raw.get("version"), raw.get("sha256"), raw.get("size")
+    if (isinstance(v, int) and not isinstance(v, bool) and v > 0
+            and isinstance(sha, str) and _SHA256_RE.match(sha)
+            and isinstance(size, int) and not isinstance(size, bool)
+            and 0 < size <= UPDATE_MAX_MANUAL):
         return {"version": v, "sha256": sha, "size": size}
     return None
 
@@ -3923,6 +3941,7 @@ class ManagerClient:
                          "undervoltage_since_boot": bool(power.get("since_boot")),
                          "disk": disk},
             "content":  content,
+            "manual":   self._hashes.get(MANUAL_PDFS[0]),
             "job":      job,
             "failed":   failed,
             "results":  results,
@@ -3967,7 +3986,8 @@ class ManagerClient:
             self._wait_ok = True
             self._wait_wake.set()
         self.run_commands(reply.get("commands"))
-        self._maybe_fetch(server, desired, body["content"], player)
+        self._maybe_fetch(server, desired, body["content"], player,
+                          manager_clean_manual(reply.get("manual")), body["manual"])
 
     def _link_changed(self, server: str, ok: bool, error: str, server_name: str = "",
                       managed=None, player=None):
@@ -4059,11 +4079,21 @@ class ManagerClient:
             self._wake.set()
 
     # ── clips and player versions ────────────────────────────────────────────
-    def _maybe_fetch(self, server: str, desired: dict, have: dict, player=None):
+    def _maybe_fetch(self, server: str, desired: dict, have: dict, player=None,
+                     manual=None, have_manual=None):
+        """One download at a time, in this order: clips (what is on screen),
+        the user manual, then a newer player version (it restarts the player,
+        so it goes last). The manual is the one published with the version the
+        manager wants here; it is taken only for this version or a newer one -
+        never an older version's - and a manual that fails waits its retry
+        without holding up the player update."""
         now = time.monotonic()
         wanted = dict(desired)
         if player and player["version"] > PLAYER_VERSION:
             wanted["player"] = player
+        if (manual and manual["version"] >= PLAYER_VERSION
+                and (have_manual or {}).get("sha256") != manual["sha256"]):
+            wanted["manual"] = manual
         with state_lock:                    # never restart the player mid-clip
             busy = state.trigger_running or state.restart_in_progress
         with self._lock:
@@ -4075,6 +4105,9 @@ class ManagerClient:
                 return
             todo = [(s, it) for s, it in manager_plan(desired, have)
                     if not (s in self._retry and now < self._retry[s]["at"])]
+            if not todo and "manual" in wanted and not (
+                    "manual" in self._retry and now < self._retry["manual"]["at"]):
+                todo = [("manual", wanted["manual"])]
             if not todo and "player" in wanted and not busy and not (
                     "player" in self._retry and now < self._retry["player"]["at"]):
                 todo = [("player", wanted["player"])]
@@ -4085,9 +4118,47 @@ class ManagerClient:
             self._fetching = True
             self._link["job"] = {"slot": slot, "sha256": item["sha256"],
                                  "size": item["size"], "done": 0}
-        target = self._update_player if slot == "player" else self._fetch
+        target = {"player": self._update_player, "manual": self._fetch_manual}.get(slot, self._fetch)
         threading.Thread(target=target, args=(server, slot, item),
                          daemon=True, name="manager-fetch").start()
+
+    def _fetch_manual(self, server: str, slot: str, item: dict):
+        """The user manual from the manager (v25) - for units that cannot reach
+        GitHub, whose own update brings it (_update_manual). The same rules:
+        size and SHA-256 must match, a temp file swapped in, and a failure is
+        logged once and never stands in the way of anything else."""
+        sha = item["sha256"]
+        dest = MANUAL_PDFS[0]
+        tmp = None
+        try:
+            with requests.get("%s/api/v1/manual/%s" % (server, sha), headers=self._auth(),
+                              stream=True, timeout=MANAGER_FETCH_TIMEOUT,
+                              allow_redirects=False) as r:
+                if r.status_code != 200:
+                    raise ManagerError("the manager answered HTTP %d for the manual" % r.status_code)
+                content = _read_capped(r, UPDATE_MAX_MANUAL)
+            if len(content) != item["size"] or hashlib.sha256(content).hexdigest() != sha:
+                raise ManagerError("the manual arrived damaged (checksum mismatch) - discarded")
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), suffix=".manual.tmp")
+            with os.fdopen(fd, "wb") as f:
+                f.write(content)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, dest)
+            tmp = None
+            self._hashes.put(dest, sha, len(content))
+            with self._lock:
+                self._retry.pop("manual", None)
+            logger.info("Central manager: user manual updated (v%d's, %d KB)",
+                        item["version"], len(content) // 1024)
+        except Exception as e:
+            self._failed("manual", sha, _manager_request_error(e))
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            self._done()
 
     @staticmethod
     def _part_path(sha: str) -> str:
@@ -4217,7 +4288,7 @@ class ManagerClient:
             delay = manager_retry_delay(failures)
             self._retry[key] = {"sha256": sha, "failures": failures,
                                 "at": time.monotonic() + delay, "error": msg}
-        what = "the player update" if key == "player" else "the %s clip" % key
+        what = {"player": "the player update", "manual": "the user manual"}.get(key, "the %s clip" % key)
         if failures == 1 or (prev and prev["error"] != msg):
             logger.warning("Central manager: could not fetch %s: %s. Trying again in %d s, "
                            "and less often after that; logged again only if the reason "
@@ -5989,10 +6060,10 @@ function mgrShow(d){
   if(d.player_target)parts.push('The manager is updating this unit to v'+d.player_target+'.');
   if(d.job){
     const pct=d.job.size?Math.floor(100*d.job.done/d.job.size):0;
-    parts.push(d.job.slot==='player'?'Fetching the new player version: '+pct+' %.':'Fetching the new '+(MGR_SLOTS[d.job.slot]||d.job.slot)+' clip: '+pct+' %.');
+    parts.push(d.job.slot==='player'?'Fetching the new player version: '+pct+' %.':d.job.slot==='manual'?'Fetching the user manual: '+pct+' %.':'Fetching the new '+(MGR_SLOTS[d.job.slot]||d.job.slot)+' clip: '+pct+' %.');
   }
   Object.keys(d.failed||{}).forEach(function(s){
-    parts.push((s==='player'?'Player update':(MGR_SLOTS[s]||s)+' clip')+' not fetched: '+d.failed[s].error+' - trying again in '+d.failed[s].retry_in+' s.');
+    parts.push((s==='player'?'Player update':s==='manual'?'User manual':(MGR_SLOTS[s]||s)+' clip')+' not fetched: '+d.failed[s].error+' - trying again in '+d.failed[s].retry_in+' s.');
   });
   st.textContent=parts.join(' ');
 }
