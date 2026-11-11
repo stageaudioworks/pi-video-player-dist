@@ -235,7 +235,10 @@ build_jobs() {   # build_jobs [MEMINFO_PATH]
 
 # The kernel's major.minor as one number: 6.12 -> 612. The module build goes
 # down the clang path for >= 6.10 (upstream's build.sh compares 612 >= 72, so in
-# practice every modern kernel), and >= 6.15 sends RTP in bursts.
+# practice every modern kernel), and >= 6.15 sends RTP in bursts - the reference
+# design called 6.12 the proven kernel; this player's bench proved 6.18 with a
+# Q-SYS Core (17-hour soak), and a capture there saw the bursts (gaps up to
+# ~12 ms between packets) without Q-SYS minding.
 # The compiler the running kernel was built with - "gcc" or "clang" - from its
 # own headers; "gcc" when they do not say (every Raspberry Pi kernel is gcc).
 kernel_compiler() {   # kernel_compiler [COMPILE_H]
@@ -536,8 +539,9 @@ report_state() {
     info "kernel:      $krel ($(uname -m))"
     local kn; kn="$(kernel_num "$krel")"
     if [ "$kn" -ge 615 ]; then
-        warn "             kernel >= 6.15 sends RTP in bursts (ravenna-alsa-lkm#39):"
-        warn "             receivers with small buffers stutter. 6.12 is the proven one."
+        warn "             kernel >= 6.15 sends RTP in small bursts (ravenna-alsa-lkm#39)."
+        warn "             Q-SYS takes it (proven on 6.18, a 17-hour soak); a receiver"
+        warn "             with a very small buffer may stutter."
     fi
     if [ -d "/lib/modules/$krel/build" ]; then
         info "headers:     present"

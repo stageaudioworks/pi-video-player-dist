@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v23)
+Stage Audio Works Raspberry Pi Video Player  (v24)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -26,7 +26,8 @@ physical buttons and the matching clip plays once, then the loop resumes.
 
 Features:
   • Loop attractor video
-  • GPIO triggers (up to 3) — ignored while a clip is already playing
+  • GPIO triggers (up to 3) — ignored while a clip is already playing;
+    Restart Loop ends a playing clip, so the next trigger is taken (v24)
   • Override mode — replaces the attractor video and ignores GPIO
   • Audio output device selection, persisted across reboots. Enumerates ALSA
     PCMs via 'aplay -L'; changing the device hot-restarts mpv so audio
@@ -530,7 +531,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 23
+PLAYER_VERSION = 24
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -640,6 +641,7 @@ class PlayerState:
     current_trigger_video: Optional[str] = None
     trigger_running:       bool          = False
     trigger_stop:          bool          = False   # the handset went back: end the clip
+    trigger_gen:           int           = 0       # bumped by each clip, and by Restart Loop ending one
     restart_in_progress:   bool          = False
     paused:                bool          = False
     volume:                int           = DEFAULT_VOLUME
@@ -2994,13 +2996,15 @@ def wait_for_playback_end(
     startup_grace:  float = 0.3,
     poll_interval:  float = 0.2,
     safety_timeout: float = 24 * 3600,
+    gen:            Optional[int] = None,
 ) -> bool:
     """
     Block until the currently playing trigger video finishes.
     Uses mpv's 'time-pos' and 'duration' properties.
 
     Returns True if playback ended naturally.
-    Returns False if interrupted early (override activated, mpv stopped).
+    Returns False if interrupted early (override activated, mpv stopped, or -
+    `gen` no longer the current trigger - Restart Loop ended this clip).
     The caller uses the return value to decide whether to resume the loop.
     """
     time.sleep(startup_grace)
@@ -3014,6 +3018,8 @@ def wait_for_playback_end(
         # so we just need to stop blocking — the finally block in play_trigger
         # checks this return value and skips the redundant switch_video call.
         with state_lock:
+            if gen is not None and state.trigger_gen != gen:
+                return False         # Restart Loop ended this clip and loaded the loop (v24)
             if state.override_active:
                 logger.info("wait_for_playback_end: override activated — exiting early")
                 return False
@@ -3073,6 +3079,8 @@ def play_trigger(pin: int, source: str = "button"):
             return
         state.trigger_running       = True
         state.trigger_stop          = False
+        state.trigger_gen          += 1
+        gen                         = state.trigger_gen
         video_path                  = TRIGGER_VIDEOS.get(pin)
         state.current_trigger_video = os.path.basename(video_path) if video_path else None
         state.paused                = False
@@ -3082,26 +3090,73 @@ def play_trigger(pin: int, source: str = "button"):
         if not video_path or not os.path.exists(video_path):
             logger.warning("Trigger video not found: %s", video_path)
             return
-        switch_video(video_path, loop=False)
-        natural_end = wait_for_playback_end()
+        with _trigger_switch_lock:
+            with state_lock:
+                still_ours = state.trigger_gen == gen
+            if still_ours:                 # else Restart Loop got in first: leave its loop on screen
+                switch_video(video_path, loop=False)
+        if still_ours:
+            natural_end = wait_for_playback_end(gen=gen)
     except Exception:
         logger.exception("Error in trigger playback pin %s", pin)
     finally:
         with state_lock:
-            state.trigger_running       = False
-            state.trigger_stop          = False
-            state.current_trigger_video = None
-            state.paused                = False
+            ended_by_restart = state.trigger_gen != gen
+            if not ended_by_restart:
+                state.trigger_running       = False
+                state.trigger_stop          = False
+                state.current_trigger_video = None
+                state.paused                = False
             override_interrupted        = state.override_active
             should_resume               = not state.restart_in_progress
 
-        if override_interrupted:
+        if ended_by_restart:
+            # Restart Loop already cleared the trigger state and loaded the
+            # loop - and a new clip may be playing by now. Touch nothing.
+            logger.info("Trigger pin %s ended by Restart Loop", pin)
+        elif override_interrupted:
             # Override activated mid-trigger — it already called switch_video.
             # Don't issue another switch here or it will cause a stutter.
             logger.info("Trigger finished — override is active, not resuming loop.")
         elif should_resume:
             path, loop = _desired_video()
             switch_video(path, loop=loop)
+
+def restart_loop(source: str = "web UI"):
+    """
+    Restart Loop (the web UI's button, UDP "restart", the manager's remote
+    control): load the loop (or the override) from the start - and end any
+    trigger clip playing, so the next trigger is taken at once (v24). Until
+    v23 the trigger's thread went on waiting for its clip's end on the loop,
+    which never comes, and every trigger was ignored as "already playing".
+
+    Ending it bumps `trigger_gen`: the clip's thread sees that, stands down
+    and touches no state - a new clip may already be running by then.
+    `_trigger_switch_lock` orders this switch against a clip's own, so a clip
+    starting at the same moment can never land on top of the loop.
+    """
+    with _trigger_switch_lock:
+        with state_lock:
+            state.restart_in_progress = True
+            ended = state.current_trigger_video if state.trigger_running else None
+            if state.trigger_running:
+                state.trigger_gen          += 1
+                state.trigger_running       = False
+                state.trigger_stop          = False
+                state.current_trigger_video = None
+                state.paused                = False
+        if ended:
+            logger.info("Restart Loop via %s — ending trigger clip %s", source, ended)
+        try:
+            path, loop = _desired_video()
+            switch_video(path, loop=loop)
+        finally:
+            with state_lock:
+                state.restart_in_progress = False
+
+# Orders a trigger clip's switch against Restart Loop's. Taken before
+# state_lock, never inside it, and nothing else takes it.
+_trigger_switch_lock = threading.Lock()
 
 # Open the GPIO chip handle once at module level and share across all pin workers
 _gpio_handle: Optional[int] = None
@@ -4260,14 +4315,7 @@ def run_action(action: str, source: str = "udp"):
             state.paused = True
 
     elif action == "restart":
-        with state_lock:
-            state.restart_in_progress = True
-        try:
-            path, loop = _desired_video()
-            switch_video(path, loop=loop)
-        finally:
-            with state_lock:
-                state.restart_in_progress = False
+        restart_loop(via)
 
     elif action == "override_on":
         with state_lock:
@@ -6366,14 +6414,7 @@ def pause():
 
 @app.route("/restart", methods=["POST"])
 def restart():
-    with state_lock:
-        state.restart_in_progress = True
-    try:
-        path, loop = _desired_video()
-        switch_video(path, loop=loop)
-    finally:
-        with state_lock:
-            state.restart_in_progress = False
+    restart_loop("web UI")
     return ("", 204)
 
 @app.route("/status")

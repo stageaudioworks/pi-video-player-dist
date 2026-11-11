@@ -1,9 +1,9 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v23**. Features that arrived in a recent version
+**Applies to:** software version **v24**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
-**Last updated:** 2026-10-26
+**Last updated:** 2026-11-11
 
 This manual covers day-to-day operation, installation, network control, the HTTP
 API, and fault-finding. Sections 2–5 are what an on-site operator needs; sections
@@ -199,7 +199,7 @@ easier to tell several open browser tabs apart when managing a fleet.
 |---|---|
 | **▶ Play** | Resumes playback after a pause |
 | **⏸ Pause** | Freezes the current frame |
-| **🔄 Restart Loop** | Jumps back to the start of the attractor loop |
+| **🔄 Restart Loop** | Jumps back to the start of the attractor loop. If a trigger clip is playing, it ends it, and the next press of a trigger plays (v24) |
 | **⏻ Reboot Pi** | Reboots the whole unit. Takes 30–60 seconds to return. |
 
 Pause is a genuine pause — the frame stays on screen. It does not survive a reboot.
@@ -1044,7 +1044,7 @@ cat /proc/asound/RAVENNA/pcm0p/sub0/status                    # RUNNING, with hw
 | **The panel says the daemon restarted** | A receiver may need the stream renamed (13.4). Then dismiss the alert. `journalctl -u aes67-daemon -b` says why it restarted. |
 | **Stream not listed in Q-SYS Auto mode** | Announcements are multicast: same VLAN, and the switch passes 239.255.255.255 |
 | **Receiver reports a grandmaster mismatch** | The receiver's SDP is older than a grandmaster change — import it again |
-| **Robotic or distorted sound** | Kernel 6.15 or later (`uname -r`) → CPU governor not *performance* → CPU temperature |
+| **Robotic or distorted sound** | CPU governor not *performance* → CPU temperature → the receiver's buffer: from kernel 6.15 (`uname -r`) the Pi sends in small bursts, which Q-SYS handles but a receiver with a very small buffer may not |
 | **Short gaps every few minutes** | The panel's clock alert. Check the grandmaster is stable, and NTP on the Pi. |
 | **Audio leads or lags the picture** | Lip-sync offset (13.5) |
 | **AES67 not offered in Audio Output** | The installer has not finished on this unit — run it with `--check` |
@@ -1195,5 +1195,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v23.*
+*Stage Audio Works — Raspberry Pi Video Player, v24.*
 *This software is provided with no warranty and no support. See `README.md`.*
