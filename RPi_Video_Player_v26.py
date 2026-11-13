@@ -17,7 +17,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 """  
-Stage Audio Works Raspberry Pi Video Player  (v25)
+Stage Audio Works Raspberry Pi Video Player  (v26)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Headless video player for museum / exhibition installations on a Raspberry Pi 5.
@@ -28,6 +28,9 @@ Features:
   • Loop attractor video
   • GPIO triggers (up to 3) — ignored while a clip is already playing;
     Restart Loop ends a playing clip, so the next trigger is taken (v24)
+  • Clip format check (v26): a clip the Pi 5 cannot decode in hardware
+    (H.264, VP9, AV1, MPEG-4) or above 1080p is flagged in Manage Videos and
+    on upload, with what to re-encode to. It still plays.
   • Override mode — replaces the attractor video and ignores GPIO
   • Audio output device selection, persisted across reboots. Enumerates ALSA
     PCMs via 'aplay -L'; changing the device hot-restarts mpv so audio
@@ -532,7 +535,7 @@ SAW_PLAYER_SIGNATURE = "SAW-PLAYER-AUTHENTIC"
 # and the GitHub update compares against it. Deliberately NOT in
 # REQUIRED_FUNCTIONS: older scripts do not have it, and listing it there would
 # stop a manual rollback to them through the web UI.
-PLAYER_VERSION = 25
+PLAYER_VERSION = 26
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_FILE                 = "/home/pi/saw_player.log"
@@ -4236,6 +4239,7 @@ class ManagerClient:
                 had = self._retry.pop(slot, None)
             logger.info("Central manager: new %s clip in place (%.1f MB, %s)%s", slot,
                         size / _MB, sha[:12], " after %d failed tries" % had["failures"] if had else "")
+            log_clip_format(dest, "the central manager")
             ram_pinner.request("manager %s" % slot)
             self._show_if_on_screen(dest)
         except Exception as e:
@@ -4580,8 +4584,189 @@ def _get_uptime() -> str:
     except Exception:
         return "N/A"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CLIP FORMAT CHECK  (v26)
+# ══════════════════════════════════════════════════════════════════════════════
+# The Pi 5 decodes H.265 (HEVC) in hardware and nothing else: H.264 - and VP9,
+# AV1, MPEG-4 - are decoded on the CPU. A field unit playing 4K H.264 ran mpv
+# at 372% CPU (all four cores) and rebooted itself on a marginal supply
+# (under-voltage); the same clips as 1080p HEVC ran at 55-100% (hwdec
+# drm-copy). Above 1080p even HEVC drops frames (manual, section 3). So the
+# web UI warns about such a clip - it still plays; nothing is refused.
+#
+# The codec and size come from the MP4's own header (moov > trak > mdia >
+# minf > stbl > stsd), read with a handful of seeks: no ffprobe (not
+# installed by mpv), nothing decoded, and a clip whose header cannot be read
+# gets no warning rather than a wrong one.
+
+CLIP_MAX_PIXELS = 1920 * 1088          # 1080p, either way up (and H.264's coded 1088)
+_CLIP_CODECS    = {b"avc1": "h264", b"avc3": "h264", b"hvc1": "hevc", b"hev1": "hevc",
+                   b"av01": "av1", b"vp09": "vp9", b"mp4v": "mpeg4"}
+_CLIP_CONTAINERS = (b"moov", b"trak", b"mdia", b"minf", b"stbl")
+_clip_fmt_cache: dict = {}             # path -> ((size, mtime_ns), result)
+_clip_fmt_lock  = threading.Lock()
+
+
+def _mp4_boxes(f, start: int, end: int, budget: list):
+    """Yield (type, payload_start, box_end) for the boxes between start and
+    end. Stops at anything malformed, and after budget[0] boxes in all - a
+    damaged file can never loop it or send it reading the whole clip."""
+    pos = start
+    while pos + 8 <= end and budget[0] > 0:
+        budget[0] -= 1
+        f.seek(pos)
+        head = f.read(8)
+        if len(head) < 8:
+            return
+        size, btype = int.from_bytes(head[:4], "big"), head[4:8]
+        hdr = 8
+        if size == 1:
+            ext = f.read(8)
+            if len(ext) < 8:
+                return
+            size, hdr = int.from_bytes(ext, "big"), 16
+        elif size == 0:
+            size = end - pos               # "to the end of the enclosing box/file"
+        if size < hdr or pos + size > end:
+            return
+        yield btype, pos + hdr, pos + size
+        pos += size
+
+
+def mp4_video_format(path: str) -> Optional[dict]:
+    """{"codec": "h264"|"hevc"|..., "width": w, "height": h} of an MP4's first
+    video track, or None if the header cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            budget = [5000]
+            return _mp4_find_video(f, 0, f.tell(), budget, 0)
+    except (OSError, ValueError):
+        return None
+
+
+def _mp4_find_video(f, start: int, end: int, budget: list, depth: int) -> Optional[dict]:
+    if depth > 6:
+        return None
+    for btype, body, bend in _mp4_boxes(f, start, end, budget):
+        if btype == b"trak":
+            fmt = _mp4_trak(f, body, bend, budget)
+            if fmt:
+                return fmt
+        elif btype in _CLIP_CONTAINERS:
+            fmt = _mp4_find_video(f, body, bend, budget, depth + 1)
+            if fmt:
+                return fmt
+    return None
+
+
+def _mp4_trak(f, start: int, end: int, budget: list) -> Optional[dict]:
+    """One track, if its handler is 'vide': the codec and size from its stsd's
+    first entry; its running time from mdhd (duration / timescale); its frame
+    rate from stsz's sample count over that time. A fragmented MP4 keeps its
+    samples outside the moov, so it has no running time or frame rate here -
+    those are left out (None), never guessed."""
+    found = {}
+
+    def walk(s, e, depth):
+        for btype, body, bend in _mp4_boxes(f, s, e, budget):
+            if btype == b"hdlr" and bend - body >= 12:
+                f.seek(body + 8)               # version/flags, pre_defined
+                found.setdefault("handler", f.read(4))   # the first: mdia's, not minf's (QuickTime)
+            elif btype == b"mdhd" and "timescale" not in found and bend - body >= 24:
+                f.seek(body)
+                head = f.read(32)
+                unknown = None
+                if head[:1] == b"\x01" and len(head) >= 32:     # version 1: 64-bit times
+                    found["timescale"] = int.from_bytes(head[20:24], "big")
+                    found["duration"] = int.from_bytes(head[24:32], "big")
+                    unknown = 0xFFFFFFFFFFFFFFFF
+                elif len(head) >= 20:
+                    found["timescale"] = int.from_bytes(head[12:16], "big")
+                    found["duration"] = int.from_bytes(head[16:20], "big")
+                    unknown = 0xFFFFFFFF
+                if found.get("duration") == unknown:        # all ones: "not known"
+                    found["duration"] = 0
+            elif btype == b"stsz" and "samples" not in found and bend - body >= 12:
+                f.seek(body + 8)               # version/flags, sample_size
+                found["samples"] = int.from_bytes(f.read(4), "big")
+            elif btype == b"stsd" and "fourcc" not in found and bend - body >= 8 + 36:
+                f.seek(body + 8)               # version/flags, entry_count
+                entry = f.read(36)             # the first sample entry's start
+                if len(entry) == 36:
+                    found["fourcc"] = entry[4:8]
+                    found["width"] = int.from_bytes(entry[32:34], "big")
+                    found["height"] = int.from_bytes(entry[34:36], "big")
+            elif btype in _CLIP_CONTAINERS and depth < 4:
+                walk(body, bend, depth + 1)
+
+    walk(start, end, 0)
+    if found.get("handler") != b"vide" or "fourcc" not in found:
+        return None
+    fourcc = found["fourcc"]
+    codec = _CLIP_CODECS.get(fourcc) or fourcc.decode("ascii", "replace").strip()
+    seconds = fps = None
+    ts, dur, n = found.get("timescale", 0), found.get("duration", 0), found.get("samples", 0)
+    if ts > 0 and dur > 0 and dur // ts < 7 * 86400 and round(dur / ts, 3) > 0:
+        seconds = round(dur / ts, 3)
+        if n > 1:
+            rate = n / (dur / ts)
+            if 1 <= rate <= 300:
+                fps = round(rate, 2)
+    return {"codec": codec, "width": found["width"], "height": found["height"],
+            "fps": fps, "seconds": seconds}
+
+
+def clip_warning(fmt: Optional[dict]) -> Optional[str]:
+    """What is wrong with a clip of this format on a Pi 5, or None."""
+    if not fmt:
+        return None
+    problems = []
+    name = {"h264": "H.264", "av1": "AV1", "vp9": "VP9", "mpeg4": "MPEG-4"}.get(fmt["codec"])
+    if name:                               # an unknown one: say nothing rather than guess
+        problems.append("%s is decoded on the CPU (the Pi 5 decodes only H.265 in hardware)" % name)
+    if fmt["width"] * fmt["height"] > CLIP_MAX_PIXELS:
+        problems.append("%dx%d is above 1080p and drops frames" % (fmt["width"], fmt["height"]))
+    if not problems:
+        return None
+    return ("; ".join(problems) + ". It plays, but works the Pi hard - heat, and on a weak "
+            "power supply under-voltage reboots. Re-encode as H.265, 1920x1080, 25 fps.")
+
+
+def clip_format(path: str) -> Optional[dict]:
+    """mp4_video_format, cached until the file changes - the slot list is
+    polled every 10 s by every open page."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_size, st.st_mtime_ns)
+    with _clip_fmt_lock:
+        hit = _clip_fmt_cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    fmt = mp4_video_format(path)
+    with _clip_fmt_lock:
+        _clip_fmt_cache[path] = (key, fmt)
+    return fmt
+
+
+def log_clip_format(path: str, via: str):
+    """Once per new clip (an upload, a clip from the manager): say if it is one
+    the Pi will struggle with."""
+    warn = clip_warning(clip_format(path))
+    if warn:
+        logger.warning("%s (%s, via %s): %s", os.path.basename(path), _clip_fmt_label(path), via, warn)
+
+
+def _clip_fmt_label(path: str) -> str:
+    fmt = clip_format(path)
+    return "%s %dx%d" % (fmt["codec"], fmt["width"], fmt["height"]) if fmt else "format unknown"
+
+
 def _get_video_slots() -> dict:
-    """Return size and existence info for each video slot."""
+    """Return size and existence info for each video slot - and, from v26,
+    each clip's format and a warning if the Pi will struggle with it."""
     slots = {
         "loop":     LOOP_VIDEO,
         "trigger1": TRIGGER_VIDEOS.get(GPIO_PINS[0], ""),
@@ -4597,6 +4782,12 @@ def _get_video_slots() -> dict:
                 "%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path))
             )
             result[name] = {"exists": True, "size_mb": size_mb, "modified": mtime}
+            fmt = clip_format(path)
+            if fmt:
+                result[name]["format"] = fmt
+                warn = clip_warning(fmt)
+                if warn:
+                    result[name]["warning"] = warn
         else:
             result[name] = {"exists": False}
     return result
@@ -5021,6 +5212,9 @@ input[type=range]{width:260px;vertical-align:middle}
 .slot-badge{font-size:0.75em;padding:2px 7px;border-radius:10px;font-weight:bold;margin-left:6px}
 .slot-ok{background:var(--ok-bg);color:var(--ok-fg)}
 .slot-missing{background:var(--err-bg);color:var(--err-fg)}
+.slot-warn{background:var(--warn-bg);color:var(--warn-fg)}
+.slot-info{font-size:0.78em;color:var(--muted);margin:-4px 0 8px}
+.slot-warn-msg{display:none;background:var(--warn-bg);color:var(--warn-fg);border-left:4px solid #e0a800;padding:5px 9px;font-size:0.8em;margin:-2px 0 8px;border-radius:4px}
 /* toast */
 #toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(80px);
   background:#222;color:#fff;padding:12px 26px;border-radius:10px;font-size:0.95em;
@@ -5030,6 +5224,7 @@ input[type=range]{width:260px;vertical-align:middle}
 #toast.ok{background:#28a745}
 #toast.err{background:#dc3545}
 #toast.info{background:#007bff}
+#toast.warn{background:#b8860b}
 /* override / audio */
 .audio-hint{font-size:0.8em;color:var(--muted);margin:4px 0 6px}
 .audio-hint a{color:var(--link)}
@@ -5232,6 +5427,19 @@ async function deleteClip(url,label,essential){
   }catch(e){toast('Delete request failed','err');}
   fetchSlotStatus();
 }
+/* v26: "H.265 · 1920×1080 · 25 fps · 9:37" - what is in a slot, from the clip's own header */
+function clipInfo(f){
+  const dot=' '+String.fromCharCode(183)+' ';
+  const names={hevc:'H.265',h264:'H.264',av1:'AV1',vp9:'VP9',mpeg4:'MPEG-4'};
+  const parts=[names[f.codec]||String(f.codec).toUpperCase(),f.width+String.fromCharCode(215)+f.height];
+  if(f.fps){const r=Math.round(f.fps);parts.push((Math.abs(f.fps-r)<0.02?r:f.fps.toFixed(2))+' fps');}
+  if(f.seconds!=null){
+    const t=Math.round(f.seconds),h=Math.floor(t/3600),m=Math.floor(t%3600/60),sec=t%60;
+    const p2=n=>(n<10?'0':'')+n;
+    parts.push(h?(h+':'+p2(m)+':'+p2(sec)):(m+':'+p2(sec)));
+  }
+  return parts.join(dot);
+}
 async function fetchSlotStatus(){
   try{
     const d=await(await fetch('/system/video_slots')).json();
@@ -5241,19 +5449,30 @@ async function fetchSlotStatus(){
       const s=d[key];
       const db=document.getElementById(dels[key]);
       if(db)db.disabled=!(s&&s.exists);   /* nothing to delete on an empty slot */
+      /* v26: a clip the Pi 5 will struggle with (H.264, above 1080p) - it plays, with a warning */
+      const im=document.getElementById(id.replace('sl_','si_'));
+      if(im)im.textContent=(s&&s.exists&&s.format)?clipInfo(s.format):'';
+      const wm=document.getElementById(id.replace('sl_','sw_'));
+      if(wm){
+        const w=(s&&s.exists&&s.warning)||'';
+        wm.textContent=w?(String.fromCharCode(9888)+' '+w):'';
+        wm.style.display=w?'block':'none';
+      }
       const el=document.getElementById(id);
       if(!el)continue;
       if(s&&s.exists){
-        el.className='slot-badge slot-ok';
-        el.title=s.modified;
-        el.textContent=s.size_mb+'MB';
+        const f=s.format;
+        el.className='slot-badge '+(s.warning?'slot-warn':'slot-ok');
+        el.title=s.modified+(f?(' '+String.fromCharCode(8212)+' '+f.codec.toUpperCase()+' '+f.width+'x'+f.height):'');
+        el.textContent=(s.warning?(String.fromCharCode(9888)+' '):'')+s.size_mb+'MB';
       } else {
         el.className='slot-badge slot-missing';
         el.textContent='missing';
         el.title='';
       }
     }
-  }catch(e){}
+    return d;
+  }catch(e){return null;}
 }
 setInterval(fetchSlotStatus,10000);
 
@@ -5685,7 +5904,12 @@ function doUpload(inputId,url,label,barId,lblId,wrapId,btnId){
       bar.style.width='100%';lbl.textContent='Complete!';
       toast('✅ '+label+' uploaded — '+file.name,'ok');
       input.value='';
-      fetchSlotStatus();
+      const slotKey={'/upload/loop':'loop','/upload/trigger/1':'trigger1','/upload/trigger/2':'trigger2',
+                     '/upload/trigger/3':'trigger3','/upload/override':'override'}[url];
+      fetchSlotStatus().then(d=>{
+        const s=d&&slotKey&&d[slotKey];
+        if(s&&s.warning)toast(String.fromCharCode(9888)+' '+label+': '+s.warning,'warn',15000);
+      });
       fetchMaxUpload();
       setTimeout(()=>{wrap.style.display='none';bar.style.width='0%';},3000);
     } else {
@@ -6300,6 +6524,8 @@ document.documentElement.setAttribute('data-theme',t);})();
     <button class="btn btn-red btn-sm" id="d_{{ slot_id }}" title="Delete this clip"
       onclick="deleteClip('{{ slot_url.replace('/upload/','/delete/') }}','{{ slot_label }}',{{ 'true' if slot_id == 'f_loop' else 'false' }})">&#128465;</button>
   </div>
+  <div class="slot-info" id="{{ slot_badge.replace('sl_','si_') }}"></div>
+  <div class="slot-warn-msg" id="{{ slot_badge.replace('sl_','sw_') }}"></div>
   <div class="prog-wrap" id="pw_{{ slot_id }}">
     <div class="prog-bg"><div class="prog-fg" id="pb_{{ slot_id }}"></div></div>
     <div class="prog-lbl" id="pl_{{ slot_id }}"></div>
@@ -6317,6 +6543,8 @@ document.documentElement.setAttribute('data-theme',t);})();
     <button class="btn btn-red btn-sm" id="d_f_ov" title="Delete this clip"
       onclick="deleteClip('/delete/override','Override',false)">&#128465;</button>
   </div>
+  <div class="slot-info" id="si_ov"></div>
+  <div class="slot-warn-msg" id="sw_ov"></div>
   <div class="prog-wrap" id="pw_ov">
     <div class="prog-bg"><div class="prog-fg" id="pb_ov"></div></div>
     <div class="prog-lbl" id="pl_ov"></div>
@@ -6864,6 +7092,7 @@ def upload(video_type, trigger_id=None):
         os.replace(tmp_path, dest)
         tmp_path = None
         logger.info("Uploaded %s → %s", f.filename, dest)
+        log_clip_format(dest, "upload")                # H.264 / above 1080p: said once (v26)
         ram_pinner.request("upload %s" % video_type)   # unpin old, pin new
         return redirect(url_for("index"))
     except Exception:

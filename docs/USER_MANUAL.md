@@ -1,9 +1,9 @@
 # Stage Audio Works — Raspberry Pi Video Player
 ## Technical User Manual
 
-**Applies to:** software version **v25**. Features that arrived in a recent version
+**Applies to:** software version **v26**. Features that arrived in a recent version
 say which, so a unit running an older version can be told apart.
-**Last updated:** 2026-11-11
+**Last updated:** 2026-11-13
 
 This manual covers day-to-day operation, installation, network control, the HTTP
 API, and fault-finding. Sections 2–5 are what an on-site operator needs; sections
@@ -234,7 +234,20 @@ and without a visible stutter.
 ### 4.6 Managing videos
 
 Each slot has its own row showing a badge with the current file's size, and its
-modification date on hover. A slot with no file shows **missing**.
+modification date on hover. A slot with no file shows **missing**. Under each clip a
+line shows what it is (v26), read from the file itself — for example
+**H.265 · 1920×1080 · 25 fps · 9:37**: codec, resolution, frame rate and running time.
+A fragmented MP4 shows only its codec and resolution.
+
+**A clip the Pi 5 will struggle with is flagged (v26).** If a clip is H.264 (or VP9,
+AV1, MPEG-4), or larger than 1080p, its badge turns amber with a ⚠, a line under the
+row says what is wrong and what to re-encode to, and an upload of such a clip ends
+with the same warning. **The clip still plays** — nothing is refused. But the Pi 5
+decodes only H.265 in hardware: a 4K H.264 clip measured on a site unit kept all four
+CPU cores busy (372% CPU) and, on a marginal power supply, rebooted the unit through
+under-voltage; the same content as 1080p H.265 ran at about a quarter of that.
+Re-encode as **H.265, 1920×1080, 25 fps** (section 3). Clips from the central manager
+are checked the same way.
 
 | Button | Effect |
 |---|---|
@@ -651,7 +664,7 @@ All endpoints are served on port 5000. No authentication.
 | `POST` | `/upload/loop`, `/upload/override`, `/upload/trigger/<1-3>` | Upload a clip (multipart, field `file`) |
 | `GET`  | `/download/loop`, `/download/override`, `/download/trigger/<1-3>` | Download a clip |
 | `POST` | `/delete/loop`, `/delete/override`, `/delete/trigger/<1-3>` | Delete a clip |
-| `GET`  | `/system/video_slots` | Size, modification date and presence of each slot |
+| `GET`  | `/system/video_slots` | Size, modification date and presence of each slot; from v26 also `format` (codec, width, height, fps, seconds) and a `warning` for a clip the Pi will struggle with |
 | `GET`  | `/system/max_upload` | Current upload size limit in bytes |
 
 ### Output
@@ -768,6 +781,7 @@ ip -s link show eth0                          # network error counters
 | **Buttons do nothing** | Override mode is on (by far the most common) → trigger file missing → a clip is already playing → wiring between GPIO pin and ground |
 | **Web page loads but every field shows a dash** | A JavaScript error is stopping the page. Open the browser console. Usually follows a bad script deployment — roll back with the `.bak` file. |
 | **No audio** | Audio device selection → volume slider not at zero → the physical output the display or amplifier is actually using → `aplay -l` shows the device |
+| **Unit reboots by itself, nothing in the player's log** | Power: `vcgencmd get_throttled` (`0x0` is clean; a last digit of 5 means under-voltage *now*, `0x50000` since boot) → a ⚠ on a clip in Manage Videos: H.264 or 4K content keeps the CPU flat out and pulls the supply down — re-encode as H.265 1080p → a short, thick USB-C cable and the official 5 V / 5 A supply |
 | **Video judders** | Content is 4K — re-encode at 1080p → try a 50 Hz output mode for 25 fps content → check CPU temperature for throttling |
 | **Unit unreachable on the network** | Cable and switch port → `ip -s link show eth0` for errors → does it have an address → has DHCP moved it |
 | **Web page will not load but video plays** | The service is running but Flask has failed — check `journalctl -u saw-player -n 50` |
@@ -1195,5 +1209,5 @@ One runs at a time.
 
 ---
 
-*Stage Audio Works — Raspberry Pi Video Player, v25.*
+*Stage Audio Works — Raspberry Pi Video Player, v26.*
 *This software is provided with no warranty and no support. See `README.md`.*
